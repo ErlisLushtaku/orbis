@@ -3,3 +3,5 @@
 *.gif
 *.ckpt
 *.pth
+logs_sae
+sae/slurm/logs
