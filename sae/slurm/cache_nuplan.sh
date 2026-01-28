@@ -1,32 +1,26 @@
 #!/bin/bash
 #
-# SLURM Job Script: Train SAE on NuPlan Videos
+# SLURM Job Script: Cache Activations for NuPlan Videos
+#
+# This is a caching-only script for use with the orchestrator (launch.py).
+# It caches activations without training an SAE.
 #
 # Usage:
-#   sbatch sae/slurm/train_nuplan.sh [OPTIONS]
+#   sbatch sae/slurm/cache_nuplan.sh [OPTIONS]
 #
-# Options (override defaults):
+# Options:
 #   --layer N          Layer to extract activations from (default: 22)
-#   --k N              Top-K sparsity (default: 64)
-#   --expansion N      SAE expansion factor (default: 16)
 #   --num_videos N     Number of videos to use (default: 988)
-#   --epochs N         Number of training epochs (default: 50)
 #   --batch_size N     Batch size for caching (default: 4)
-#   --sae_batch_mult N SAE batch multiplier (default: 1024)
-#   --seed N           Random seed (default: 42)
+#   --seed N           Random seed for noise (default: 42)
 #   --rebuild_cache    Force rebuild of activation cache
-#   --train_only       Skip caching, assume cache exists (used by orchestrator)
-#   --barcode NAME     Use specific barcode instead of auto-generating
+#   --run_name NAME    Override run name (default: cache_s{seed}_{timestamp})
 #
-# Examples:
-#   sbatch sae/slurm/train_nuplan.sh --layer 12
-#   sbatch sae/slurm/train_nuplan.sh --layer 12 --k 128 --expansion 32
-#
-# Logs will be saved to: sae/slurm/logs/nuplan/{model}/layer_{N}/train/{barcode}.{out,err}
+# Note: Log paths are set via sbatch CLI when called from launch.py
 #
 
-#SBATCH --job-name=sae_nuplan
-#SBATCH --time=24:00:00
+#SBATCH --job-name=sae_cache_nuplan
+#SBATCH --time=48:00:00
 #SBATCH --partition=lmbhiwidlc_gpu-rtx2080
 #SBATCH --account=lmbhiwi-dlc
 #SBATCH --gres=gpu:1
@@ -45,18 +39,13 @@ NUPLAN_DATA="/work/dlcsmall2/galessos-nuPlan/nuPlan_640x360_10Hz"
 DATA_SOURCE="nuplan"
 MODEL_NAME="orbis_288x512"
 
-# Default training parameters (can be overridden via command line)
+# Default caching parameters
 BATCH_SIZE=4
-NUM_EPOCHS=50
 LAYER=22
-K=64
-EXPANSION_FACTOR=16
-SAE_BATCH_MULTIPLIER=1024
 SEED=42
 NUM_VIDEOS=988
 REBUILD_CACHE="false"
-TRAIN_ONLY="false"
-BARCODE=""
+RUN_NAME=""
 
 # ------------------------------
 # Parse Command Line Arguments
@@ -67,28 +56,12 @@ while [[ $# -gt 0 ]]; do
             LAYER="$2"
             shift 2
             ;;
-        --k)
-            K="$2"
-            shift 2
-            ;;
-        --expansion)
-            EXPANSION_FACTOR="$2"
-            shift 2
-            ;;
         --num_videos)
             NUM_VIDEOS="$2"
             shift 2
             ;;
-        --epochs)
-            NUM_EPOCHS="$2"
-            shift 2
-            ;;
         --batch_size)
             BATCH_SIZE="$2"
-            shift 2
-            ;;
-        --sae_batch_mult)
-            SAE_BATCH_MULTIPLIER="$2"
             shift 2
             ;;
         --seed)
@@ -99,40 +72,35 @@ while [[ $# -gt 0 ]]; do
             REBUILD_CACHE="true"
             shift
             ;;
-        --train_only)
-            TRAIN_ONLY="true"
-            shift
-            ;;
-        --barcode)
-            BARCODE="$2"
+        --run_name)
+            RUN_NAME="$2"
             shift 2
             ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: sbatch train_nuplan.sh [--layer N] [--k N] [--expansion N] [--num_videos N] [--epochs N] [--batch_size N] [--sae_batch_mult N] [--seed N] [--rebuild_cache] [--train_only] [--barcode NAME]"
+            echo "Usage: sbatch cache_nuplan.sh [--layer N] [--num_videos N] [--batch_size N] [--seed N] [--rebuild_cache] [--run_name NAME]"
             exit 1
             ;;
     esac
 done
 
 # ------------------------------
-# Generate unique barcode (or use provided one)
+# Generate run name if not provided
 # ------------------------------
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-EXP="$EXPANSION_FACTOR"
-if [ -z "$BARCODE" ]; then
-    BARCODE="topk_x${EXP}_k${K}_s${SEED}_${TIMESTAMP}"
+if [ -z "$RUN_NAME" ]; then
+    RUN_NAME="cache_s${SEED}_${TIMESTAMP}"
 fi
 
 # ------------------------------
 # Setup log directories
 # ------------------------------
 ORBIS_ROOT="/work/dlclarge2/lushtake-thesis/orbis"
-LOG_DIR="${ORBIS_ROOT}/sae/slurm/logs/${DATA_SOURCE}/${MODEL_NAME}/layer_${LAYER}/train"
+LOG_DIR="${ORBIS_ROOT}/sae/slurm/logs/sae_cache/${DATA_SOURCE}/${MODEL_NAME}/layer_${LAYER}"
 mkdir -p "$LOG_DIR"
 
 # Redirect stdout and stderr to log files
-exec > "${LOG_DIR}/${BARCODE}.out" 2> "${LOG_DIR}/${BARCODE}.err"
+exec > "${LOG_DIR}/${RUN_NAME}.out" 2> "${LOG_DIR}/${RUN_NAME}.err"
 
 # Clean up initial SLURM logs
 rm -f /work/dlclarge2/lushtake-thesis/orbis/sae/slurm/logs/slurm_init_${SLURM_JOB_ID}.out \
@@ -141,9 +109,9 @@ rm -f /work/dlclarge2/lushtake-thesis/orbis/sae/slurm/logs/slurm_init_${SLURM_JO
 # ------------------------------
 # Environment Setup
 # ------------------------------
-echo "=== SAE Training on NuPlan Dataset ==="
+echo "=== SAE Activation Caching for NuPlan Dataset ==="
 echo "Job ID: $SLURM_JOB_ID"
-echo "Barcode: $BARCODE"
+echo "Run Name: $RUN_NAME"
 echo "Node: $(hostname)"
 echo "Start: $(date)"
 echo ""
@@ -167,30 +135,24 @@ echo "Exp dir: $EXP_DIR"
 echo "NuPlan data: $NUPLAN_DATA"
 echo ""
 
-echo "Training parameters:"
+echo "Caching parameters:"
 echo "  data_source=$DATA_SOURCE"
 echo "  model=$MODEL_NAME"
 echo "  layer=$LAYER"
 echo "  batch_size=$BATCH_SIZE"
-echo "  sae_batch_multiplier=$SAE_BATCH_MULTIPLIER"
-echo "  num_epochs=$NUM_EPOCHS"
-echo "  k=$K"
-echo "  expansion_factor=$EXPANSION_FACTOR"
 echo "  seed=$SEED"
 echo "  num_videos=$NUM_VIDEOS"
 echo "  rebuild_cache=$REBUILD_CACHE"
-echo "  train_only=$TRAIN_ONLY"
 echo ""
-echo "Output paths:"
-echo "  Run dir: logs_sae/runs/${DATA_SOURCE}/${MODEL_NAME}/layer_${LAYER}/${BARCODE}/"
-echo "  Log dir: ${LOG_DIR}/${BARCODE}.{out,err}"
+echo "Cache directory: logs_sae/sae_cache/${DATA_SOURCE}/${MODEL_NAME}/layer_${LAYER}/"
+echo "Log files: ${LOG_DIR}/${RUN_NAME}.{out,err}"
 echo ""
 
-echo "Starting SAE training..."
+echo "Starting activation caching..."
 echo ""
 
-# Build command
-TRAIN_CMD="python sae/scripts/train_sae.py \
+# Build command (caching only - no SAE-specific args)
+CACHE_CMD="python sae/scripts/train_sae.py \
     --exp_dir \"$EXP_DIR\" \
     --data_source \"$DATA_SOURCE\" \
     --nuplan_data_dir \"$NUPLAN_DATA\" \
@@ -198,28 +160,19 @@ TRAIN_CMD="python sae/scripts/train_sae.py \
     --stored_frame_rate 10 \
     --input_size 288 512 \
     --batch_size \"$BATCH_SIZE\" \
-    --sae_batch_multiplier \"$SAE_BATCH_MULTIPLIER\" \
-    --num_epochs \"$NUM_EPOCHS\" \
-    --k \"$K\" \
-    --expansion_factor \"$EXPANSION_FACTOR\" \
     --layer \"$LAYER\" \
-    --seed \"$SEED\" \
-    --run_name \"$BARCODE\" \
-    --streaming"
+    --cache_seed \"$SEED\" \
+    --run_name \"$RUN_NAME\" \
+    --cache_only"
 
-# Add optional flags
+# Add rebuild_cache flag if needed
 if [ "$REBUILD_CACHE" = "true" ]; then
-    TRAIN_CMD="$TRAIN_CMD --rebuild_cache"
+    CACHE_CMD="$CACHE_CMD --rebuild_cache"
     echo "[WARNING] REBUILD_CACHE=true - existing cache will be deleted and rebuilt!"
 fi
 
-if [ "$TRAIN_ONLY" = "true" ]; then
-    TRAIN_CMD="$TRAIN_CMD --train_only"
-    echo "[INFO] TRAIN_ONLY=true - skipping caching, assuming cache exists"
-fi
-
-eval $TRAIN_CMD
+eval $CACHE_CMD
 
 echo ""
-echo "=== Training Complete ==="
+echo "=== Caching Complete ==="
 echo "End: $(date)"
