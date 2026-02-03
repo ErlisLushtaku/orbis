@@ -24,11 +24,11 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Dict, Optional, Sequence
+from typing import Dict, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Dataset, Subset
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
@@ -46,6 +46,8 @@ from pytorch_lightning import seed_everything
 # Local imports (use absolute imports for script execution)
 from sae.topk_sae import TopKSAE, TopKSAEConfig, TopKSAETrainer
 from sae.caching import (
+    CacheResumeInfo,
+    get_cache_resume_info,
     prepare_activation_cache,
     create_activation_dataloader,
     resolve_cache_dtype,
@@ -253,6 +255,68 @@ def create_dataloaders_hdf5(
     return train_loader, val_loader
 
 
+def create_datasets_covla(
+    videos_dir: str,
+    captions_dir: Optional[str],
+    input_size: tuple,
+    num_frames: int = 6,
+    stored_data_frame_rate: int = 20,
+    frame_rate: int = 5,
+    num_videos: Optional[int] = None,
+    val_split: float = 0.1,
+) -> Tuple[Dataset, Dataset]:
+    """
+    Create train and validation datasets for CoVLA video data.
+    Returns Dataset objects (not DataLoaders) to enable zero-cost resume via Subset.
+    
+    Args:
+        videos_dir: Path to CoVLA videos directory
+        captions_dir: Path to CoVLA captions directory (optional)
+        input_size: Target image size (H, W)
+        num_frames: Number of frames per clip
+        stored_data_frame_rate: Frame rate of stored videos
+        frame_rate: Target frame rate for sampling
+        num_videos: Limit number of videos (None for all)
+        val_split: Fraction of videos for validation
+        
+    Returns:
+        Tuple of (train_dataset, val_dataset)
+    """
+    # 1. Instantiate the Full Dataset ONCE
+    full_dataset = CoVLAOrbisMultiFrame(
+        num_frames=num_frames,
+        stored_data_frame_rate=stored_data_frame_rate,
+        target_frame_rate=frame_rate,
+        size=input_size,
+        captions_dir=captions_dir,
+        videos_dir=videos_dir,
+        num_samples=num_videos,
+        debug=False,
+    )
+    
+    # 2. Calculate Split Boundaries based on VIDEO count
+    total_videos = full_dataset.num_videos
+    clips_per_video = full_dataset.clips_per_video
+    
+    num_val_videos = max(1, int(total_videos * val_split))
+    num_train_videos = total_videos - num_val_videos
+    
+    # 3. Create Indices
+    train_end_idx = num_train_videos * clips_per_video
+    train_indices = range(0, train_end_idx)
+    val_indices = range(train_end_idx, len(full_dataset))
+    
+    # 4. Create Subsets
+    dataset_train = Subset(full_dataset, train_indices)
+    dataset_val = Subset(full_dataset, val_indices)
+
+    print(f"[data] CoVLA Full: {total_videos} videos, {len(full_dataset)} total clips")
+    print(f"[data] Train Split: {num_train_videos} videos ({len(dataset_train)} clips)")
+    print(f"[data] Val Split:   {num_val_videos} videos ({len(dataset_val)} clips)")
+
+    return dataset_train, dataset_val
+
+
 def create_dataloaders_covla(
     videos_dir: str,
     captions_dir: Optional[str],
@@ -269,42 +333,20 @@ def create_dataloaders_covla(
     """
     Create train and validation dataloaders for CoVLA video data.
     Uses Subset to strictly split video IDs without leakage.
+    
+    NOTE: For zero-cost resume, use create_datasets_covla() instead and
+    apply Subset before creating DataLoaders.
     """
-    # 1. Instantiate the Full Dataset ONCE
-    # This scans the directory just one time (efficient)
-    full_dataset = CoVLAOrbisMultiFrame(
+    dataset_train, dataset_val = create_datasets_covla(
+        videos_dir=videos_dir,
+        captions_dir=captions_dir,
+        input_size=input_size,
         num_frames=num_frames,
         stored_data_frame_rate=stored_data_frame_rate,
-        target_frame_rate=frame_rate,
-        size=input_size,
-        captions_dir=captions_dir,
-        videos_dir=videos_dir,
-        num_samples=num_videos,
-        debug=False,
+        frame_rate=frame_rate,
+        num_videos=num_videos,
+        val_split=val_split,
     )
-    
-    # 2. Calculate Split Boundaries based on VIDEO count
-    # We want to ensure all 25 clips from "Video A" stay in the same split
-    total_videos = full_dataset.num_videos
-    clips_per_video = full_dataset.clips_per_video
-    
-    num_val_videos = max(1, int(total_videos * val_split))
-    num_train_videos = total_videos - num_val_videos
-    
-    # 3. Create Indices (The Math)
-    # Train gets the first N videos * 25 clips
-    train_end_idx = num_train_videos * clips_per_video
-    
-    # Range of indices for training
-    train_indices = range(0, train_end_idx)
-    
-    # Range of indices for validation
-    val_indices = range(train_end_idx, len(full_dataset))
-    
-    # 4. Create Subsets
-    # This wraps the dataset so it only sees the assigned indices
-    dataset_train = Subset(full_dataset, train_indices)
-    dataset_val = Subset(full_dataset, val_indices)
 
     loader_kwargs = dict(
         batch_size=batch_size,
@@ -316,28 +358,33 @@ def create_dataloaders_covla(
     train_loader = DataLoader(dataset_train, shuffle=False, **loader_kwargs)
     val_loader = DataLoader(dataset_val, shuffle=False, **loader_kwargs)
 
-    print(f"[data] CoVLA Full: {total_videos} videos, {len(full_dataset)} total clips")
-    print(f"[data] Train Split: {num_train_videos} videos ({len(dataset_train)} clips)")
-    print(f"[data] Val Split:   {num_val_videos} videos ({len(dataset_val)} clips)")
-
     return train_loader, val_loader
 
 
-def create_dataloaders_nuplan(
+def create_datasets_nuplan(
     data_dir: str,
     input_size: tuple,
-    batch_size: int,
-    num_workers: int,
-    device: torch.device,
     num_frames: int = 6,
     stored_data_frame_rate: int = 10,
     frame_rate: int = 5,
     num_videos: Optional[int] = None,
     val_split: float = 0.1,
-) -> tuple:
+) -> Tuple[Dataset, Dataset]:
     """
-    Create train and validation dataloaders for NuPlan video data.
-    Uses Subset to strictly split video IDs without leakage.
+    Create train and validation datasets for NuPlan video data.
+    Returns Dataset objects (not DataLoaders) to enable zero-cost resume via Subset.
+    
+    Args:
+        data_dir: Path to NuPlan data directory
+        input_size: Target image size (H, W)
+        num_frames: Number of frames per clip
+        stored_data_frame_rate: Frame rate of stored videos
+        frame_rate: Target frame rate for sampling
+        num_videos: Limit number of videos (None for all)
+        val_split: Fraction of videos for validation
+        
+    Returns:
+        Tuple of (train_dataset, val_dataset)
     """
     # 1. Instantiate the Full Dataset ONCE
     full_dataset = NuPlanOrbisMultiFrame(
@@ -376,6 +423,42 @@ def create_dataloaders_nuplan(
     dataset_train = Subset(full_dataset, train_indices)
     dataset_val = Subset(full_dataset, val_indices)
 
+    print(f"[data] NuPlan Full: {total_videos} videos, {len(full_dataset)} total clips")
+    print(f"[data] Train Split: {num_train_videos} videos ({len(dataset_train)} clips)")
+    print(f"[data] Val Split:   {num_val_videos} videos ({len(dataset_val)} clips)")
+
+    return dataset_train, dataset_val
+
+
+def create_dataloaders_nuplan(
+    data_dir: str,
+    input_size: tuple,
+    batch_size: int,
+    num_workers: int,
+    device: torch.device,
+    num_frames: int = 6,
+    stored_data_frame_rate: int = 10,
+    frame_rate: int = 5,
+    num_videos: Optional[int] = None,
+    val_split: float = 0.1,
+) -> tuple:
+    """
+    Create train and validation dataloaders for NuPlan video data.
+    Uses Subset to strictly split video IDs without leakage.
+    
+    NOTE: For zero-cost resume, use create_datasets_nuplan() instead and
+    apply Subset before creating DataLoaders.
+    """
+    dataset_train, dataset_val = create_datasets_nuplan(
+        data_dir=data_dir,
+        input_size=input_size,
+        num_frames=num_frames,
+        stored_data_frame_rate=stored_data_frame_rate,
+        frame_rate=frame_rate,
+        num_videos=num_videos,
+        val_split=val_split,
+    )
+
     loader_kwargs = dict(
         batch_size=batch_size,
         num_workers=num_workers,
@@ -385,11 +468,51 @@ def create_dataloaders_nuplan(
     train_loader = DataLoader(dataset_train, shuffle=False, **loader_kwargs)
     val_loader = DataLoader(dataset_val, shuffle=False, **loader_kwargs)
 
-    print(f"[data] NuPlan Full: {total_videos} videos, {len(full_dataset)} total clips")
-    print(f"[data] Train Split: {num_train_videos} videos ({len(dataset_train)} clips)")
-    print(f"[data] Val Split:   {num_val_videos} videos ({len(dataset_val)} clips)")
-
     return train_loader, val_loader
+
+
+def create_dataloader_with_offset(
+    dataset: Dataset,
+    batch_size: int,
+    num_workers: int,
+    device: torch.device,
+    start_sample_idx: int = 0,
+) -> DataLoader:
+    """
+    Create a DataLoader, optionally subsetting the dataset for zero-cost resume.
+    
+    If start_sample_idx > 0, creates a Subset containing only samples from
+    that index onwards, enabling true zero-cost resume without iterating
+    through already-processed samples.
+    
+    Args:
+        dataset: The source dataset (may already be a Subset)
+        batch_size: Batch size for the DataLoader
+        num_workers: Number of data loading workers
+        device: Device (used to determine pin_memory)
+        start_sample_idx: Starting sample index for resume (0 = no resume)
+        
+    Returns:
+        DataLoader configured for sequential caching (shuffle=False)
+    """
+    # Apply resume subset if needed
+    if start_sample_idx > 0:
+        if start_sample_idx >= len(dataset):
+            # All samples already processed - return empty dataloader
+            remaining_indices = range(0, 0)  # Empty range
+        else:
+            remaining_indices = range(start_sample_idx, len(dataset))
+        dataset = Subset(dataset, remaining_indices)
+        print(f"[data] Applied resume subset: {len(dataset)} samples remaining")
+    
+    loader_kwargs = dict(
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=(device.type == "cuda"),
+        shuffle=False,  # Must be False for deterministic caching
+    )
+    
+    return DataLoader(dataset, **loader_kwargs)
 
 
 def create_dataloaders(
@@ -724,83 +847,308 @@ def main(args: argparse.Namespace, unknown_args: Sequence[str] = ()):
     hidden_size = model.vit.blocks[0].norm1.normalized_shape[0]
     print(f"[setup] ST-Transformer hidden size: {hidden_size}")
 
-    # Create data loaders for activation extraction
-    print(f"[data] Loading data from {args.data_source} source")
-    train_loader, val_loader = create_dataloaders(
-        data_source=args.data_source,
-        data_path=args.data_path,
-        input_size=tuple(args.input_size),
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        device=device,
-        hdf5_paths_file=args.hdf5_paths_file,
-        val_json=args.val_json,
-        num_frames=args.num_frames,
-        stored_data_frame_rate=args.stored_frame_rate,
-        frame_rate=args.frame_rate,
-        image_paths=args.image_paths,
-        covla_videos_dir=args.covla_videos_dir,
-        covla_captions_dir=args.covla_captions_dir,
-        nuplan_data_dir=args.nuplan_data_dir,
-        num_videos=args.num_videos,
-    )
-
-    # Cache activations
-    cache_dtype = resolve_cache_dtype(args.cache_dtype)
-
-    print(f"\n[cache] Caching train activations...")
+    # Cache directories
     train_cache_dir = cache_dir / "train"
-    train_cache_files = prepare_activation_cache(
-        model=model,
-        dataloader=train_loader,
-        cache_dir=train_cache_dir,
-        layer_idx=args.layer,
-        device=device,
-        dtype=cache_dtype,
-        dtype_name=args.cache_dtype,
-        rebuild=args.rebuild_cache,
-        t_noise=args.t_noise,
-        frame_rate=args.frame_rate,
-    )
-
-    print(f"\n[cache] Caching validation activations...")
     val_cache_dir = cache_dir / "val"
-    val_cache_files = prepare_activation_cache(
-        model=model,
-        dataloader=val_loader,
-        cache_dir=val_cache_dir,
-        layer_idx=args.layer,
-        device=device,
-        dtype=cache_dtype,
-        dtype_name=args.cache_dtype,
-        rebuild=args.rebuild_cache,
-        t_noise=args.t_noise,
-        frame_rate=args.frame_rate,
-    )
+    cache_dtype = resolve_cache_dtype(args.cache_dtype)
+    
+    # ========================================================================
+    # ZERO-COST RESUME FLOW for CoVLA and NuPlan
+    # For these sources, we:
+    # 1. Create datasets first (not dataloaders)
+    # 2. Check cache status to determine resume point
+    # 3. Create dataloaders with Subset for remaining samples
+    # 4. Cache only the remaining activations
+    # ========================================================================
+    
+    print(f"[data] Loading data from {args.data_source} source")
+    
+    if args.data_source in ("covla", "nuplan"):
+        # === Step 1: Create datasets (not dataloaders) ===
+        if args.data_source == "covla":
+            if args.covla_videos_dir is None:
+                raise ValueError("covla_videos_dir required for CoVLA data source")
+            train_dataset, val_dataset = create_datasets_covla(
+                videos_dir=args.covla_videos_dir,
+                captions_dir=args.covla_captions_dir,
+                input_size=tuple(args.input_size),
+                num_frames=args.num_frames,
+                stored_data_frame_rate=args.stored_frame_rate,
+                frame_rate=args.frame_rate,
+                num_videos=args.num_videos,
+            )
+        else:  # nuplan
+            if args.nuplan_data_dir is None:
+                raise ValueError("nuplan_data_dir required for NuPlan data source")
+            train_dataset, val_dataset = create_datasets_nuplan(
+                data_dir=args.nuplan_data_dir,
+                input_size=tuple(args.input_size),
+                num_frames=args.num_frames,
+                stored_data_frame_rate=args.stored_frame_rate,
+                frame_rate=args.frame_rate,
+                num_videos=args.num_videos,
+            )
+        
+        # === Step 2: Check cache status for zero-cost resume ===
+        print(f"\n[cache] Checking train cache status...")
+        train_resume = get_cache_resume_info(
+            cache_dir=train_cache_dir,
+            batch_size=args.batch_size,
+            total_samples=len(train_dataset),
+            rebuild=args.rebuild_cache,
+        )
+        
+        print(f"\n[cache] Checking validation cache status...")
+        val_resume = get_cache_resume_info(
+            cache_dir=val_cache_dir,
+            batch_size=args.batch_size,
+            total_samples=len(val_dataset),
+            rebuild=args.rebuild_cache,
+        )
+        
+        # === Step 3: Create dataloaders with Subset for remaining samples ===
+        train_loader = create_dataloader_with_offset(
+            dataset=train_dataset,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            device=device,
+            start_sample_idx=train_resume.start_sample_idx,
+        )
+        
+        val_loader = create_dataloader_with_offset(
+            dataset=val_dataset,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            device=device,
+            start_sample_idx=val_resume.start_sample_idx,
+        )
+        
+        # === Step 4: Cache activations (zero-cost resume) ===
+        # Skip caching if --train_only is set (assumes cache exists)
+        if args.train_only:
+            print(f"\n[cache] --train_only: Skipping caching, assuming cache exists")
+            train_cache_files = train_resume.valid_files
+            val_cache_files = val_resume.valid_files
+            if not train_resume.is_complete or not val_resume.is_complete:
+                raise RuntimeError(
+                    "--train_only specified but cache is incomplete. "
+                    "Run caching first or remove --train_only flag."
+                )
+        else:
+            # Determine data_dir for metadata
+            data_dir = args.covla_videos_dir if args.data_source == "covla" else args.nuplan_data_dir
+            
+            try:
+                if not train_resume.is_complete:
+                    print(f"\n[cache] Caching train activations...")
+                    train_cache_files = prepare_activation_cache(
+                        model=model,
+                        dataloader=train_loader,
+                        cache_dir=train_cache_dir,
+                        layer_idx=args.layer,
+                        device=device,
+                        dtype=cache_dtype,
+                        dtype_name=args.cache_dtype,
+                        t_noise=args.t_noise,
+                        frame_rate=args.frame_rate,
+                        start_batch_idx=train_resume.start_batch_idx,
+                        existing_tokens=train_resume.total_tokens,
+                        existing_files=train_resume.valid_files,
+                        existing_hidden_dim=train_resume.hidden_dim,
+                        # Reproducibility metadata
+                        seed=args.cache_seed,
+                        orbis_exp_dir=str(exp_dir),
+                        data_source=args.data_source,
+                        data_dir=data_dir,
+                        num_videos=args.num_videos,
+                        num_frames=args.num_frames,
+                        val_split=0.1,  # Hardcoded in create_datasets_*
+                        input_size=tuple(args.input_size),
+                        stored_frame_rate=args.stored_frame_rate,
+                    )
+                else:
+                    print(f"\n[cache] Train cache complete, skipping...")
+                    train_cache_files = train_resume.valid_files
+                
+                if not val_resume.is_complete:
+                    print(f"\n[cache] Caching validation activations...")
+                    val_cache_files = prepare_activation_cache(
+                        model=model,
+                        dataloader=val_loader,
+                        cache_dir=val_cache_dir,
+                        layer_idx=args.layer,
+                        device=device,
+                        dtype=cache_dtype,
+                        dtype_name=args.cache_dtype,
+                        t_noise=args.t_noise,
+                        frame_rate=args.frame_rate,
+                        start_batch_idx=val_resume.start_batch_idx,
+                        existing_tokens=val_resume.total_tokens,
+                        existing_files=val_resume.valid_files,
+                        existing_hidden_dim=val_resume.hidden_dim,
+                        # Reproducibility metadata
+                        seed=args.cache_seed,
+                        orbis_exp_dir=str(exp_dir),
+                        data_source=args.data_source,
+                        data_dir=data_dir,
+                        num_videos=args.num_videos,
+                        num_frames=args.num_frames,
+                        val_split=0.1,
+                        input_size=tuple(args.input_size),
+                        stored_frame_rate=args.stored_frame_rate,
+                    )
+                else:
+                    print(f"\n[cache] Validation cache complete, skipping...")
+                    val_cache_files = val_resume.valid_files
+                
+                # Exit after caching if --cache_only is set
+                if args.cache_only:
+                    print(f"\n[cache] --cache_only: Caching complete, exiting")
+                    sys.exit(0)
+                    
+            except Exception as e:
+                print(f"\n[cache] FAILED: {e}")
+                sys.exit(1)  # Non-zero exit for SLURM afterok dependency
+    
+    else:
+        # === LEGACY FLOW for other data sources (cityscapes, hdf5, image_paths) ===
+        # These don't benefit from zero-cost resume as much, use simple flow
+        train_loader, val_loader = create_dataloaders(
+            data_source=args.data_source,
+            data_path=args.data_path,
+            input_size=tuple(args.input_size),
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            device=device,
+            hdf5_paths_file=args.hdf5_paths_file,
+            val_json=args.val_json,
+            num_frames=args.num_frames,
+            stored_data_frame_rate=args.stored_frame_rate,
+            frame_rate=args.frame_rate,
+            image_paths=args.image_paths,
+            covla_videos_dir=args.covla_videos_dir,
+            covla_captions_dir=args.covla_captions_dir,
+            nuplan_data_dir=args.nuplan_data_dir,
+            num_videos=args.num_videos,
+        )
+        
+        # Check cache for these sources (simpler flow without zero-cost resume)
+        train_resume = get_cache_resume_info(
+            cache_dir=train_cache_dir,
+            batch_size=args.batch_size,
+            total_samples=len(train_loader.dataset),
+            rebuild=args.rebuild_cache,
+        )
+        val_resume = get_cache_resume_info(
+            cache_dir=val_cache_dir,
+            batch_size=args.batch_size,
+            total_samples=len(val_loader.dataset),
+            rebuild=args.rebuild_cache,
+        )
+        
+        # Skip caching if --train_only is set (assumes cache exists)
+        if args.train_only:
+            print(f"\n[cache] --train_only: Skipping caching, assuming cache exists")
+            train_cache_files = train_resume.valid_files
+            val_cache_files = val_resume.valid_files
+            if not train_resume.is_complete or not val_resume.is_complete:
+                raise RuntimeError(
+                    "--train_only specified but cache is incomplete. "
+                    "Run caching first or remove --train_only flag."
+                )
+        else:
+            try:
+                # Cache activations (will skip batches via continue if resuming)
+                if not train_resume.is_complete:
+                    print(f"\n[cache] Caching train activations...")
+                    train_cache_files = prepare_activation_cache(
+                        model=model,
+                        dataloader=train_loader,
+                        cache_dir=train_cache_dir,
+                        layer_idx=args.layer,
+                        device=device,
+                        dtype=cache_dtype,
+                        dtype_name=args.cache_dtype,
+                        t_noise=args.t_noise,
+                        frame_rate=args.frame_rate,
+                        start_batch_idx=0,  # Full dataloader, start from 0
+                        existing_tokens=0,
+                        existing_files=[],
+                        # Reproducibility metadata
+                        seed=args.cache_seed,
+                        orbis_exp_dir=str(exp_dir),
+                        data_source=args.data_source,
+                        data_dir=args.data_path,
+                        num_frames=args.num_frames,
+                        input_size=tuple(args.input_size),
+                        stored_frame_rate=args.stored_frame_rate,
+                    )
+                else:
+                    train_cache_files = train_resume.valid_files
+                
+                if not val_resume.is_complete:
+                    print(f"\n[cache] Caching validation activations...")
+                    val_cache_files = prepare_activation_cache(
+                        model=model,
+                        dataloader=val_loader,
+                        cache_dir=val_cache_dir,
+                        layer_idx=args.layer,
+                        device=device,
+                        dtype=cache_dtype,
+                        dtype_name=args.cache_dtype,
+                        t_noise=args.t_noise,
+                        frame_rate=args.frame_rate,
+                        start_batch_idx=0,
+                        existing_tokens=0,
+                        existing_files=[],
+                        # Reproducibility metadata
+                        seed=args.cache_seed,
+                        orbis_exp_dir=str(exp_dir),
+                        data_source=args.data_source,
+                        data_dir=args.data_path,
+                        num_frames=args.num_frames,
+                        input_size=tuple(args.input_size),
+                        stored_frame_rate=args.stored_frame_rate,
+                    )
+                else:
+                    val_cache_files = val_resume.valid_files
+                
+                # Exit after caching if --cache_only is set
+                if args.cache_only:
+                    print(f"\n[cache] --cache_only: Caching complete, exiting")
+                    sys.exit(0)
+                    
+            except Exception as e:
+                print(f"\n[cache] FAILED: {e}")
+                sys.exit(1)  # Non-zero exit for SLURM afterok dependency
 
     # Create activation dataloaders for SAE training
     # Use streaming mode for large datasets that don't fit in RAM
     in_memory = not args.streaming
     print(f"\n[data] Creating activation dataloaders (streaming={args.streaming})...")
     
+    sae_batch_size = args.batch_size * args.sae_batch_multiplier
     train_act_loader, train_meta = create_activation_dataloader(
         train_cache_dir,
-        batch_size=args.batch_size * 64,  # Larger batches for SAE training
+        batch_size=sae_batch_size,
         shuffle=True,
         num_workers=4 if args.streaming else 0,  # Workers help with streaming, hurt with in-memory
         in_memory=in_memory,
+        max_tokens=args.max_tokens,
     )
 
     val_act_loader, val_meta = create_activation_dataloader(
         val_cache_dir,
-        batch_size=args.batch_size * 64,
+        batch_size=sae_batch_size,
         shuffle=False,
         num_workers=4 if args.streaming else 0,
         in_memory=in_memory,
+        max_tokens=args.max_tokens,  # Use same limit for val
     )
 
-    print(f"[data] Train tokens: {train_meta['total_tokens']:,}")
-    print(f"[data] Val tokens: {val_meta['total_tokens']:,}")
+    print(f"[data] SAE batch size: {sae_batch_size:,} ({args.batch_size} × {args.sae_batch_multiplier})")
+    print(f"[data] Train tokens: {train_meta['tokens_used']:,}")
+    print(f"[data] Val tokens: {val_meta['tokens_used']:,}")
 
     # Create SAE
     sae_config = TopKSAEConfig(
@@ -818,12 +1166,10 @@ def main(args: argparse.Namespace, unknown_args: Sequence[str] = ()):
         lr=args.lr,
         weight_decay=args.weight_decay,
         device=device,
-        use_amp=not args.no_amp,
         compile_model=args.compile,
     )
     
-    if not args.no_amp:
-        print(f"[trainer] Mixed precision (AMP) enabled")
+    print(f"[trainer] Accelerate fp16 mixed precision enabled")
     if args.compile:
         print(f"[trainer] torch.compile enabled")
 
@@ -1112,6 +1458,15 @@ def parse_args(argv=None):
     parser.add_argument("--streaming", action="store_true",
                         help="Use streaming mode (load from disk) instead of loading all activations into RAM. "
                              "Required for large datasets (>50M tokens) that don't fit in memory.")
+    parser.add_argument("--max_tokens", type=int, default=None,
+                        help="Maximum tokens to use from cache (allows using subset without rebuilding). "
+                             "If None, uses all cached tokens.")
+    parser.add_argument("--cache_only", action="store_true",
+                        help="Run caching phase only, then exit. Used by orchestrator for separate cache jobs.")
+    parser.add_argument("--train_only", action="store_true",
+                        help="Skip caching, assume cache exists. Used by orchestrator for separate train jobs.")
+    parser.add_argument("--cache_seed", type=int, default=42,
+                        help="Random seed for caching noise generation (for reproducibility)")
 
     # Training
     parser.add_argument("--num_epochs", type=int, default=50,
@@ -1120,6 +1475,8 @@ def parse_args(argv=None):
                         help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=0.0,
                         help="Weight decay")
+    parser.add_argument("--sae_batch_multiplier", type=int, default=1024,
+                        help="SAE batch size = batch_size * sae_batch_multiplier")
     parser.add_argument("--eval_every", type=int, default=5,
                         help="Evaluate every N epochs")
     parser.add_argument("--save_every", type=int, default=10,
@@ -1145,6 +1502,8 @@ def parse_args(argv=None):
                         help="Random seed")
     parser.add_argument("--device", type=str, default="cuda",
                         help="Device (cuda or cpu)")
+    parser.add_argument("--compile", action="store_true",
+                        help="Use torch.compile for faster execution (default mode for Turing stability)")
 
     return parser.parse_known_args(argv)
 

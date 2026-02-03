@@ -1,16 +1,20 @@
 #!/bin/bash
 #
-# SLURM Job Script: Cache Activations for CoVLA Videos
+# SLURM Job Script: Cache Activations for SAE Training
 #
-# This is a caching-only script for use with the orchestrator (launch.py).
+# This is a unified caching script for use with the orchestrator (launch.py).
 # It caches activations without training an SAE.
 #
 # Usage:
-#   sbatch sae/slurm/cache_covla.sh [OPTIONS]
+#   sbatch sae/slurm/cache.sh --data_source nuplan [OPTIONS]
+#   sbatch sae/slurm/cache.sh --data_source covla [OPTIONS]
+#
+# Required:
+#   --data_source STR  Data source: "nuplan" or "covla"
 #
 # Options:
-#   --layer N          Layer to extract activations from (default: 12)
-#   --num_videos N     Number of videos to use (default: 3000)
+#   --layer N          Layer to extract activations from (default: 22 for nuplan, 12 for covla)
+#   --num_videos N     Number of videos to use (default: 988 for nuplan, 3000 for covla)
 #   --batch_size N     Batch size for caching (default: 4)
 #   --seed N           Random seed for noise (default: 42)
 #   --rebuild_cache    Force rebuild of activation cache
@@ -19,8 +23,8 @@
 # Note: Log paths are set via sbatch CLI when called from launch.py
 #
 
-#SBATCH --job-name=sae_cache_covla
-#SBATCH --time=24:00:00
+#SBATCH --job-name=sae_cache
+#SBATCH --time=48:00:00
 #SBATCH --partition=lmbhiwidlc_gpu-rtx2080
 #SBATCH --account=lmbhiwi-dlc
 #SBATCH --gres=gpu:1
@@ -34,14 +38,14 @@ set -eo pipefail
 # ------------------------------
 # Default Configuration
 # ------------------------------
-DATA_SOURCE="covla"
 MODEL_NAME="orbis_288x512"
+DATA_SOURCE=""
 
-# Default caching parameters
+# Default caching parameters (will be overridden based on data_source)
 BATCH_SIZE=4
-LAYER=12
+LAYER=""
 SEED=42
-NUM_VIDEOS=3000
+NUM_VIDEOS=""
 REBUILD_CACHE="false"
 RUN_NAME=""
 
@@ -50,6 +54,10 @@ RUN_NAME=""
 # ------------------------------
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --data_source)
+            DATA_SOURCE="$2"
+            shift 2
+            ;;
         --layer)
             LAYER="$2"
             shift 2
@@ -76,11 +84,46 @@ while [[ $# -gt 0 ]]; do
             ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: sbatch cache_covla.sh [--layer N] [--num_videos N] [--batch_size N] [--seed N] [--rebuild_cache] [--run_name NAME]"
+            echo "Usage: sbatch cache.sh --data_source {nuplan,covla} [--layer N] [--num_videos N] [--batch_size N] [--seed N] [--rebuild_cache] [--run_name NAME]"
             exit 1
             ;;
     esac
 done
+
+# ------------------------------
+# Validate data_source
+# ------------------------------
+if [ -z "$DATA_SOURCE" ]; then
+    echo "ERROR: --data_source is required"
+    echo "Usage: sbatch cache.sh --data_source {nuplan,covla} [OPTIONS]"
+    exit 1
+fi
+
+if [ "$DATA_SOURCE" != "nuplan" ] && [ "$DATA_SOURCE" != "covla" ]; then
+    echo "ERROR: Invalid data_source '$DATA_SOURCE'. Must be 'nuplan' or 'covla'"
+    exit 1
+fi
+
+# ------------------------------
+# Set data source specific defaults
+# ------------------------------
+ORBIS_ROOT="/work/dlclarge2/lushtake-thesis/orbis"
+EXP_DIR="${ORBIS_ROOT}/logs_wm/${MODEL_NAME}"
+
+if [ "$DATA_SOURCE" = "nuplan" ]; then
+    DATA_DIR="/work/dlcsmall2/galessos-nuPlan/nuPlan_640x360_10Hz"
+    STORED_FRAME_RATE=10
+    [ -z "$LAYER" ] && LAYER=22
+    [ -z "$NUM_VIDEOS" ] && NUM_VIDEOS=988
+    DATA_ARG="--nuplan_data_dir"
+elif [ "$DATA_SOURCE" = "covla" ]; then
+    DATA_DIR="/work/dlclarge2/lushtake-thesis/data/covla/videos"
+    CAPTIONS_DIR="/work/dlclarge2/lushtake-thesis/data/covla/captions"
+    STORED_FRAME_RATE=20
+    [ -z "$LAYER" ] && LAYER=12
+    [ -z "$NUM_VIDEOS" ] && NUM_VIDEOS=3000
+    DATA_ARG="--covla_videos_dir"
+fi
 
 # ------------------------------
 # Generate run name if not provided
@@ -93,7 +136,6 @@ fi
 # ------------------------------
 # Setup log directories
 # ------------------------------
-ORBIS_ROOT="/work/dlclarge2/lushtake-thesis/orbis"
 LOG_DIR="${ORBIS_ROOT}/sae/slurm/logs/sae_cache/${DATA_SOURCE}/${MODEL_NAME}/layer_${LAYER}"
 mkdir -p "$LOG_DIR"
 
@@ -107,7 +149,7 @@ rm -f /work/dlclarge2/lushtake-thesis/orbis/sae/slurm/logs/slurm_init_${SLURM_JO
 # ------------------------------
 # Environment Setup
 # ------------------------------
-echo "=== SAE Activation Caching for CoVLA Dataset ==="
+echo "=== SAE Activation Caching for ${DATA_SOURCE^^} Dataset ==="
 echo "Job ID: $SLURM_JOB_ID"
 echo "Run Name: $RUN_NAME"
 echo "Node: $(hostname)"
@@ -130,19 +172,9 @@ echo "Conda env: ${CONDA_DEFAULT_ENV:-unknown}"
 echo "CUDA visible: ${CUDA_VISIBLE_DEVICES:-all}"
 echo ""
 
-# ------------------------------
-# Paths
-# ------------------------------
-EXP_DIR="${ORBIS_ROOT}/logs_wm/${MODEL_NAME}"
-COVLA_VIDEOS="/work/dlclarge2/lushtake-thesis/data/covla/videos"
-COVLA_CAPTIONS="/work/dlclarge2/lushtake-thesis/data/covla/captions"
-
-cd "$ORBIS_ROOT"
-
 echo "Orbis dir: $ORBIS_ROOT"
 echo "Exp dir: $EXP_DIR"
-echo "CoVLA videos: $COVLA_VIDEOS"
-echo "CoVLA captions: $COVLA_CAPTIONS"
+echo "Data dir: $DATA_DIR"
 echo ""
 
 echo "Caching parameters:"
@@ -152,11 +184,14 @@ echo "  layer=$LAYER"
 echo "  batch_size=$BATCH_SIZE"
 echo "  seed=$SEED"
 echo "  num_videos=$NUM_VIDEOS"
+echo "  stored_frame_rate=$STORED_FRAME_RATE"
 echo "  rebuild_cache=$REBUILD_CACHE"
 echo ""
 echo "Cache directory: logs_sae/sae_cache/${DATA_SOURCE}/${MODEL_NAME}/layer_${LAYER}/"
 echo "Log files: ${LOG_DIR}/${RUN_NAME}.{out,err}"
 echo ""
+
+cd "$ORBIS_ROOT"
 
 echo "Starting activation caching..."
 echo ""
@@ -165,16 +200,20 @@ echo ""
 CACHE_CMD="python sae/scripts/train_sae.py \
     --exp_dir \"$EXP_DIR\" \
     --data_source \"$DATA_SOURCE\" \
-    --covla_videos_dir \"$COVLA_VIDEOS\" \
-    --covla_captions_dir \"$COVLA_CAPTIONS\" \
+    $DATA_ARG \"$DATA_DIR\" \
     --num_videos \"$NUM_VIDEOS\" \
-    --stored_frame_rate 20 \
+    --stored_frame_rate $STORED_FRAME_RATE \
     --input_size 288 512 \
     --batch_size \"$BATCH_SIZE\" \
     --layer \"$LAYER\" \
     --cache_seed \"$SEED\" \
     --run_name \"$RUN_NAME\" \
     --cache_only"
+
+# Add captions dir for covla
+if [ "$DATA_SOURCE" = "covla" ]; then
+    CACHE_CMD="$CACHE_CMD --covla_captions_dir \"$CAPTIONS_DIR\""
+fi
 
 # Add rebuild_cache flag if needed
 if [ "$REBUILD_CACHE" = "true" ]; then

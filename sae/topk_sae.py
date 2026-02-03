@@ -11,6 +11,7 @@ from typing import Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from accelerate import Accelerator
 
 
 @dataclass
@@ -156,9 +157,11 @@ class TopKSAETrainer:
     """
     Trainer for TopK SAE with decoder weight normalization and metric tracking.
     
-    Supports:
-        - Mixed precision training (AMP) for faster computation
-        - torch.compile for optimized execution
+    Optimized for RTX 2080 (Turing) with:
+        - HuggingFace Accelerate for fp16 mixed precision
+        - Fused AdamW optimizer for reduced kernel launches
+        - torch.compile (default mode) for optimized execution
+        - non_blocking transfers for overlapped data movement
     """
     
     def __init__(
@@ -166,29 +169,32 @@ class TopKSAETrainer:
         model: TopKSAE,
         lr: float = 1e-3,
         weight_decay: float = 0.0,
-        device: torch.device = None,
+        device: torch.device = None,  # Note: accelerator.device will be used
         dead_feature_window: int = 1000,  # Reset dead feature stats every N steps
-        use_amp: bool = True,  # Use automatic mixed precision
         compile_model: bool = False,  # Use torch.compile (PyTorch 2.0+)
     ):
-        self.model = model
-        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = self.model.to(self.device)
+        # Initialize Accelerator with fp16 (NOT bf16 - Turing doesn't support it natively)
+        self.accelerator = Accelerator(mixed_precision="fp16")
+        self.device = self.accelerator.device
         
-        # Optionally compile model for faster execution
+        # Move model to device before compilation
+        self.model = model.to(self.device)
+        
+        # Optionally compile model for faster execution (default mode for Turing stability)
         if compile_model and hasattr(torch, 'compile'):
-            print("[trainer] Compiling model with torch.compile...")
+            print("[trainer] Compiling model with torch.compile (default mode)...")
             self.model = torch.compile(self.model)
         
+        # Fused AdamW for reduced kernel launch overhead (supported on Turing)
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=lr,
             weight_decay=weight_decay,
+            fused=True,
         )
         
-        # Mixed precision training
-        self.use_amp = use_amp and self.device.type == "cuda"
-        self.scaler = torch.cuda.amp.GradScaler() if self.use_amp else None
+        # Prepare model and optimizer with accelerate (handles gradient scaling internally)
+        self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
         
         # Metric Tracking State
         self.dead_feature_window = dead_feature_window
@@ -232,7 +238,8 @@ class TopKSAETrainer:
             explained_variance = (1.0 - (residual_var / (total_var + 1e-8))).item()
             
             # Activation Density: k/d_sae as percentage
-            activation_density = (l0 / self.model.d_sae) * 100.0
+            unwrapped_model = self.accelerator.unwrap_model(self.model)
+            activation_density = (l0 / unwrapped_model.d_sae) * 100.0
             
             # L1 Norm: Total energy of sparse activations (monitors feature explosion)
             l1_norm = sparse_acts.abs().sum(dim=-1).mean().item()
@@ -246,7 +253,7 @@ class TopKSAETrainer:
                 # Periodically calculate dead % and reset counter
                 if self.step_counter % self.dead_feature_window == 0:
                     dead_count = (self.feature_hits == 0).sum().item()
-                    self.current_dead_pct = (dead_count / self.model.d_sae) * 100.0
+                    self.current_dead_pct = (dead_count / unwrapped_model.d_sae) * 100.0
                     self.feature_hits.zero_()  # Reset for next window
 
         return {
@@ -262,31 +269,25 @@ class TopKSAETrainer:
 
     def train_step(self, batch: torch.Tensor) -> dict:
         """
-        Perform a single training step with optional mixed precision.
+        Perform a single training step with fp16 mixed precision via Accelerate.
         """
         self.model.train()
-        batch = batch.to(self.device)
+        batch = batch.to(self.device, non_blocking=True)
         
         self.optimizer.zero_grad()
         
-        if self.use_amp:
-            # Mixed precision forward/backward
-            with torch.cuda.amp.autocast():
-                reconstruction, sparse_acts = self.model(batch)
-                loss = F.mse_loss(reconstruction, batch)
-            
-            self.scaler.scale(loss).backward()
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-        else:
-            # Standard precision
+        # Accelerate handles autocast and gradient scaling internally
+        with self.accelerator.autocast():
             reconstruction, sparse_acts = self.model(batch)
             loss = F.mse_loss(reconstruction, batch)
-            loss.backward()
-            self.optimizer.step()
         
-        # Normalize decoder weights (always in full precision)
-        self.model.normalize_decoder_weights()
+        # Accelerate handles gradient scaling internally
+        self.accelerator.backward(loss)
+        self.optimizer.step()
+        
+        # Normalize decoder weights (full precision, outside autocast)
+        # Use unwrap_model to access custom method through accelerate wrapper
+        self.accelerator.unwrap_model(self.model).normalize_decoder_weights()
         
         # Compute Metrics (detached, no gradient tracking)
         metrics = self.calculate_metrics(batch, reconstruction.float(), sparse_acts.float())
@@ -300,7 +301,7 @@ class TopKSAETrainer:
         Perform evaluation step without gradient updates.
         """
         self.model.eval()
-        batch = batch.to(self.device)
+        batch = batch.to(self.device, non_blocking=True)
         
         reconstruction, sparse_acts = self.model(batch)
         

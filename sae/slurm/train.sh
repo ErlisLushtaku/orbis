@@ -1,34 +1,39 @@
 #!/bin/bash
 #
-# SLURM Job Script: Train SAE on CoVLA Videos
+# SLURM Job Script: Train SAE on Video Dataset
+#
+# This is a unified training script that works with both NuPlan and CoVLA datasets.
 #
 # Usage:
-#   sbatch sae/slurm/train_covla.sh [OPTIONS]
+#   sbatch sae/slurm/train.sh --data_source nuplan [OPTIONS]
+#   sbatch sae/slurm/train.sh --data_source covla [OPTIONS]
+#
+# Required:
+#   --data_source STR  Data source: "nuplan" or "covla"
 #
 # Options (override defaults):
-#   --layer N              Layer to extract activations from (default: 12)
-#   --k N                  Top-K sparsity (default: 32)
-#   --expansion N          SAE expansion factor (default: 10)
-#   --num_videos N         Number of videos to use (default: 3000)
-#   --epochs N             Number of training epochs (default: 5)
+#   --layer N              Layer to extract activations from (default: 22 for nuplan, 12 for covla)
+#   --k N                  Top-K sparsity (default: 64)
+#   --expansion N          SAE expansion factor (default: 16)
+#   --num_videos N         Number of videos to use (default: dataset-specific)
+#   --epochs N             Number of training epochs (default: 50)
 #   --batch_size N         Batch size for caching (default: 4)
 #   --sae_batch_mult N     SAE batch multiplier (default: 1024)
 #   --seed N               Random seed (default: 42)
 #   --max_tokens N         Limit tokens used for training (default: all)
 #   --rebuild_cache        Force rebuild of activation cache
-#   --no_streaming         Disable streaming mode (load all into RAM)
 #   --train_only           Skip caching, assume cache exists (used by orchestrator)
 #   --barcode NAME         Use specific barcode instead of auto-generating
+#   --no_streaming         Disable streaming mode (load all into RAM)
 #
 # Examples:
-#   sbatch sae/slurm/train_covla.sh --layer 22
-#   sbatch sae/slurm/train_covla.sh --layer 12 --k 64 --expansion 16
-#   sbatch sae/slurm/train_covla.sh --num_videos 100 --no_streaming
+#   sbatch sae/slurm/train.sh --data_source nuplan --layer 22
+#   sbatch sae/slurm/train.sh --data_source covla --layer 12 --k 64 --expansion 16
 #
-# Logs will be saved to: sae/slurm/logs/covla/{model}/layer_{N}/train/{barcode}.{out,err}
+# Logs will be saved to: sae/slurm/logs/{dataset}/{model}/layer_{N}/train/{barcode}.{out,err}
 #
 
-#SBATCH --job-name=sae_covla
+#SBATCH --job-name=sae_train
 #SBATCH --time=24:00:00
 #SBATCH --partition=lmbhiwidlc_gpu-rtx2080
 #SBATCH --account=lmbhiwi-dlc
@@ -43,18 +48,18 @@ set -eo pipefail
 # ------------------------------
 # Default Configuration
 # ------------------------------
-DATA_SOURCE="covla"
 MODEL_NAME="orbis_288x512"
+DATA_SOURCE=""
 
-# Default training parameters (can be overridden via command line)
-LAYER=22
+# Default training parameters (will be overridden based on data_source)
+LAYER=""
 BATCH_SIZE=4
-NUM_EPOCHS=5
-K=32
-EXPANSION_FACTOR=10
+NUM_EPOCHS=50
+K=64
+EXPANSION_FACTOR=16
 SAE_BATCH_MULTIPLIER=1024
 SEED=42
-NUM_VIDEOS=3000
+NUM_VIDEOS=""
 MAX_TOKENS=""
 REBUILD_CACHE="false"
 STREAMING="true"
@@ -66,6 +71,10 @@ BARCODE=""
 # ------------------------------
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --data_source)
+            DATA_SOURCE="$2"
+            shift 2
+            ;;
         --layer)
             LAYER="$2"
             shift 2
@@ -120,11 +129,46 @@ while [[ $# -gt 0 ]]; do
             ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: sbatch train_covla.sh [--layer N] [--k N] [--expansion N] [--num_videos N] [--epochs N] [--batch_size N] [--sae_batch_mult N] [--seed N] [--max_tokens N] [--rebuild_cache] [--no_streaming] [--train_only] [--barcode NAME]"
+            echo "Usage: sbatch train.sh --data_source {nuplan,covla} [--layer N] [--k N] [--expansion N] [--num_videos N] [--epochs N] [--batch_size N] [--sae_batch_mult N] [--seed N] [--max_tokens N] [--rebuild_cache] [--no_streaming] [--train_only] [--barcode NAME]"
             exit 1
             ;;
     esac
 done
+
+# ------------------------------
+# Validate data_source
+# ------------------------------
+if [ -z "$DATA_SOURCE" ]; then
+    echo "ERROR: --data_source is required"
+    echo "Usage: sbatch train.sh --data_source {nuplan,covla} [OPTIONS]"
+    exit 1
+fi
+
+if [ "$DATA_SOURCE" != "nuplan" ] && [ "$DATA_SOURCE" != "covla" ]; then
+    echo "ERROR: Invalid data_source '$DATA_SOURCE'. Must be 'nuplan' or 'covla'"
+    exit 1
+fi
+
+# ------------------------------
+# Set data source specific defaults
+# ------------------------------
+ORBIS_ROOT="/work/dlclarge2/lushtake-thesis/orbis"
+EXP_DIR="${ORBIS_ROOT}/logs_wm/${MODEL_NAME}"
+
+if [ "$DATA_SOURCE" = "nuplan" ]; then
+    DATA_DIR="/work/dlcsmall2/galessos-nuPlan/nuPlan_640x360_10Hz"
+    STORED_FRAME_RATE=10
+    [ -z "$LAYER" ] && LAYER=22
+    [ -z "$NUM_VIDEOS" ] && NUM_VIDEOS=988
+    DATA_ARG="--nuplan_data_dir"
+elif [ "$DATA_SOURCE" = "covla" ]; then
+    DATA_DIR="/work/dlclarge2/lushtake-thesis/data/covla/videos"
+    CAPTIONS_DIR="/work/dlclarge2/lushtake-thesis/data/covla/captions"
+    STORED_FRAME_RATE=20
+    [ -z "$LAYER" ] && LAYER=12
+    [ -z "$NUM_VIDEOS" ] && NUM_VIDEOS=3000
+    DATA_ARG="--covla_videos_dir"
+fi
 
 # ------------------------------
 # Generate unique barcode (or use provided one)
@@ -137,7 +181,6 @@ fi
 # ------------------------------
 # Setup log directories
 # ------------------------------
-ORBIS_ROOT="/work/dlclarge2/lushtake-thesis/orbis"
 LOG_DIR="${ORBIS_ROOT}/sae/slurm/logs/${DATA_SOURCE}/${MODEL_NAME}/layer_${LAYER}/train"
 mkdir -p "$LOG_DIR"
 
@@ -151,7 +194,7 @@ rm -f /work/dlclarge2/lushtake-thesis/orbis/sae/slurm/logs/slurm_init_${SLURM_JO
 # ------------------------------
 # Environment Setup
 # ------------------------------
-echo "=== SAE Training on CoVLA Dataset ==="
+echo "=== SAE Training on ${DATA_SOURCE^^} Dataset ==="
 echo "Job ID: $SLURM_JOB_ID"
 echo "Barcode: $BARCODE"
 echo "Node: $(hostname)"
@@ -174,19 +217,9 @@ echo "Conda env: ${CONDA_DEFAULT_ENV:-unknown}"
 echo "CUDA visible: ${CUDA_VISIBLE_DEVICES:-all}"
 echo ""
 
-# ------------------------------
-# Paths
-# ------------------------------
-EXP_DIR="${ORBIS_ROOT}/logs_wm/${MODEL_NAME}"
-COVLA_VIDEOS="/work/dlclarge2/lushtake-thesis/data/covla/videos"
-COVLA_CAPTIONS="/work/dlclarge2/lushtake-thesis/data/covla/captions"
-
-cd "$ORBIS_ROOT"
-
 echo "Orbis dir: $ORBIS_ROOT"
 echo "Exp dir: $EXP_DIR"
-echo "CoVLA videos: $COVLA_VIDEOS"
-echo "CoVLA captions: $COVLA_CAPTIONS"
+echo "Data dir: $DATA_DIR"
 echo ""
 
 echo "Training parameters:"
@@ -210,6 +243,8 @@ echo "  Run dir: logs_sae/runs/${DATA_SOURCE}/${MODEL_NAME}/layer_${LAYER}/${BAR
 echo "  Log dir: ${LOG_DIR}/${BARCODE}.{out,err}"
 echo ""
 
+cd "$ORBIS_ROOT"
+
 echo "Starting SAE training..."
 echo ""
 
@@ -219,10 +254,9 @@ echo ""
 TRAIN_CMD="python sae/scripts/train_sae.py \
     --exp_dir \"$EXP_DIR\" \
     --data_source \"$DATA_SOURCE\" \
-    --covla_videos_dir \"$COVLA_VIDEOS\" \
-    --covla_captions_dir \"$COVLA_CAPTIONS\" \
+    $DATA_ARG \"$DATA_DIR\" \
     --num_videos \"$NUM_VIDEOS\" \
-    --stored_frame_rate 20 \
+    --stored_frame_rate $STORED_FRAME_RATE \
     --input_size 288 512 \
     --batch_size \"$BATCH_SIZE\" \
     --sae_batch_multiplier \"$SAE_BATCH_MULTIPLIER\" \
@@ -233,27 +267,31 @@ TRAIN_CMD="python sae/scripts/train_sae.py \
     --seed \"$SEED\" \
     --run_name \"$BARCODE\""
 
+# Add captions dir for covla
+if [ "$DATA_SOURCE" = "covla" ]; then
+    TRAIN_CMD="$TRAIN_CMD --covla_captions_dir \"$CAPTIONS_DIR\""
+fi
+
 # Add streaming flag if enabled
 if [ "$STREAMING" = "true" ]; then
     TRAIN_CMD="$TRAIN_CMD --streaming"
 fi
 
-# Add rebuild_cache flag if needed
+# Add optional flags
 if [ "$REBUILD_CACHE" = "true" ]; then
     TRAIN_CMD="$TRAIN_CMD --rebuild_cache"
     echo "[WARNING] REBUILD_CACHE=true - existing cache will be deleted and rebuilt!"
+fi
+
+if [ "$TRAIN_ONLY" = "true" ]; then
+    TRAIN_CMD="$TRAIN_CMD --train_only"
+    echo "[INFO] TRAIN_ONLY=true - skipping caching, assuming cache exists"
 fi
 
 # Add max_tokens if set
 if [ -n "$MAX_TOKENS" ]; then
     TRAIN_CMD="$TRAIN_CMD --max_tokens $MAX_TOKENS"
     echo "[INFO] Using max_tokens=$MAX_TOKENS (subset of cached data)"
-fi
-
-# Add train_only flag if needed
-if [ "$TRAIN_ONLY" = "true" ]; then
-    TRAIN_CMD="$TRAIN_CMD --train_only"
-    echo "[INFO] TRAIN_ONLY=true - skipping caching, assuming cache exists"
 fi
 
 eval $TRAIN_CMD
