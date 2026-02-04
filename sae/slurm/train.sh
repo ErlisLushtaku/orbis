@@ -18,7 +18,7 @@
 #   --num_videos N         Number of videos to use (default: dataset-specific)
 #   --epochs N             Number of training epochs (default: 50)
 #   --batch_size N         Batch size for caching (default: 4)
-#   --sae_batch_mult N     SAE batch multiplier (default: 1024)
+#   --sae_batch_size N     SAE batch size in tokens (default: 4096)
 #   --seed N               Random seed (default: 42)
 #   --max_tokens N         Limit tokens used for training (default: all)
 #   --rebuild_cache        Force rebuild of activation cache
@@ -57,7 +57,7 @@ BATCH_SIZE=4
 NUM_EPOCHS=50
 K=64
 EXPANSION_FACTOR=16
-SAE_BATCH_MULTIPLIER=1024
+SAE_BATCH_SIZE=4096
 SEED=42
 NUM_VIDEOS=""
 MAX_TOKENS=""
@@ -99,8 +99,8 @@ while [[ $# -gt 0 ]]; do
             BATCH_SIZE="$2"
             shift 2
             ;;
-        --sae_batch_mult)
-            SAE_BATCH_MULTIPLIER="$2"
+        --sae_batch_size)
+            SAE_BATCH_SIZE="$2"
             shift 2
             ;;
         --seed)
@@ -129,7 +129,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: sbatch train.sh --data_source {nuplan,covla} [--layer N] [--k N] [--expansion N] [--num_videos N] [--epochs N] [--batch_size N] [--sae_batch_mult N] [--seed N] [--max_tokens N] [--rebuild_cache] [--no_streaming] [--train_only] [--barcode NAME]"
+            echo "Usage: sbatch train.sh --data_source {nuplan,covla} [--layer N] [--k N] [--expansion N] [--num_videos N] [--epochs N] [--batch_size N] [--sae_batch_size N] [--seed N] [--max_tokens N] [--rebuild_cache] [--no_streaming] [--train_only] [--barcode NAME]"
             exit 1
             ;;
     esac
@@ -227,7 +227,7 @@ echo "  data_source=$DATA_SOURCE"
 echo "  model=$MODEL_NAME"
 echo "  layer=$LAYER"
 echo "  batch_size=$BATCH_SIZE"
-echo "  sae_batch_multiplier=$SAE_BATCH_MULTIPLIER"
+echo "  sae_batch_size=$SAE_BATCH_SIZE tokens"
 echo "  num_epochs=$NUM_EPOCHS"
 echo "  k=$K"
 echo "  expansion_factor=$EXPANSION_FACTOR"
@@ -259,7 +259,7 @@ TRAIN_CMD="python sae/scripts/train_sae.py \
     --stored_frame_rate $STORED_FRAME_RATE \
     --input_size 288 512 \
     --batch_size \"$BATCH_SIZE\" \
-    --sae_batch_multiplier \"$SAE_BATCH_MULTIPLIER\" \
+    --sae_batch_size \"$SAE_BATCH_SIZE\" \
     --num_epochs \"$NUM_EPOCHS\" \
     --k \"$K\" \
     --expansion_factor \"$EXPANSION_FACTOR\" \

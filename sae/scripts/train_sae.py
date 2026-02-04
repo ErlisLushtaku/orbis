@@ -1203,7 +1203,7 @@ def main(args: argparse.Namespace, unknown_args: Sequence[str] = ()):
     in_memory = not args.streaming
     logger.info(f"Creating activation dataloaders (streaming={args.streaming})...")
     
-    sae_batch_size = args.batch_size * args.sae_batch_multiplier
+    sae_batch_size = args.sae_batch_size
     train_act_loader, train_meta = create_activation_dataloader(
         train_cache_dir,
         batch_size=sae_batch_size,
@@ -1222,7 +1222,7 @@ def main(args: argparse.Namespace, unknown_args: Sequence[str] = ()):
         max_tokens=args.max_tokens,  # Use same limit for val
     )
 
-    logger.info(f"SAE batch size: {sae_batch_size:,} ({args.batch_size} × {args.sae_batch_multiplier})")
+    logger.info(f"SAE batch size: {sae_batch_size:,} tokens")
     logger.info(f"Train tokens: {train_meta['tokens_used']:,}")
     logger.info(f"Val tokens: {val_meta['tokens_used']:,}")
 
@@ -1606,8 +1606,8 @@ def parse_args(argv=None):
                         help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=0.0,
                         help="Weight decay")
-    parser.add_argument("--sae_batch_multiplier", type=int, default=1024,
-                        help="SAE batch size = batch_size * sae_batch_multiplier")
+    parser.add_argument("--sae_batch_size", type=int, default=4096,
+                        help="SAE batch size in tokens (default: 4096)")
     parser.add_argument("--eval_every", type=int, default=5,
                         help="Evaluate every N epochs")
     parser.add_argument("--save_every", type=int, default=10,
