@@ -34,8 +34,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from sae.topk_sae import TopKSAE, TopKSAEConfig
 from sae.activation_hooks import ActivationExtractor
+from sae.logging_utils import get_logger, setup_sae_logging
 from data.nuplan.nuplan_dataset import NuPlanOrbisMultiFrame
 from util import instantiate_from_config
+
+# Setup logging
+setup_sae_logging()
+logger = get_logger(__name__)
 
 
 # Odometry fields to analyze
@@ -85,13 +90,13 @@ def load_orbis_model(config_path: Path, ckpt_path: Path, device: torch.device) -
     """Load the frozen Orbis world model."""
     from omegaconf import OmegaConf
     
-    print(f"[model] Loading config from {config_path}")
+    logger.info(f" Loading config from {config_path}")
     cfg_model = OmegaConf.load(config_path)
     
-    print(f"[model] Instantiating model...")
+    logger.info(f" Instantiating model...")
     model = instantiate_from_config(cfg_model.model)
     
-    print(f"[model] Loading checkpoint from {ckpt_path}")
+    logger.info(f" Loading checkpoint from {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     state_dict = ckpt.get("state_dict", ckpt)
     model.load_state_dict(state_dict, strict=False)
@@ -101,7 +106,7 @@ def load_orbis_model(config_path: Path, ckpt_path: Path, device: torch.device) -
     for param in model.parameters():
         param.requires_grad = False
     
-    print(f"[model] Model loaded and frozen")
+    logger.info(f" Model loaded and frozen")
     return model
 
 
@@ -162,7 +167,7 @@ class NuPlanTestDataset(torch.utils.data.Dataset):
             self.start_idx = 0
             self.end_idx = len(self.dataset)
         
-        print(f"[test_data] Using clips {self.start_idx} to {self.end_idx} ({self.end_idx - self.start_idx} total)")
+        logger.info(f" Using clips {self.start_idx} to {self.end_idx} ({self.end_idx - self.start_idx} total)")
     
     def __len__(self):
         return self.end_idx - self.start_idx
@@ -215,7 +220,7 @@ def save_activations_cache(activations: List[FrameActivation], cache_path: Path)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(cache_data, cache_path)
     size_mb = cache_path.stat().st_size / (1024 * 1024)
-    print(f"[cache] Saved {len(activations)} samples to {cache_path} ({size_mb:.1f} MB)")
+    logger.info(f" Saved {len(activations)} samples to {cache_path} ({size_mb:.1f} MB)")
 
 
 def load_activations_cache(cache_path: Path) -> List[FrameActivation]:
@@ -231,7 +236,7 @@ def load_activations_cache(cache_path: Path) -> List[FrameActivation]:
             odometry=sample["odometry"],
         ))
     
-    print(f"[cache] Loaded {len(activations)} samples from {cache_path}")
+    logger.info(f" Loaded {len(activations)} samples from {cache_path}")
     return activations
 
 
@@ -248,7 +253,7 @@ def collect_activations(
     """Collect SAE latent activations for test clips."""
     
     if cache_path and cache_path.exists():
-        print(f"[cache] Found cached activations at {cache_path}")
+        logger.info(f" Found cached activations at {cache_path}")
         return load_activations_cache(cache_path)
     
     extractor = ActivationExtractor(orbis_model, layer_idx=layer_idx, flatten_spatial=True)
@@ -310,7 +315,7 @@ def compute_correlations(activations: List[FrameActivation]) -> Dict[str, List[C
     num_latents = activations[0].latent_activations.shape[0]
     num_samples = len(activations)
     
-    print(f"[correlation] Computing correlations for {num_latents} latents, {num_samples} samples")
+    logger.info(f" Computing correlations for {num_latents} latents, {num_samples} samples")
     
     latent_matrix = np.stack([a.latent_activations for a in activations], axis=0)
     
@@ -326,7 +331,7 @@ def compute_correlations(activations: List[FrameActivation]) -> Dict[str, List[C
         valid_mask = ~np.isnan(field_values)
         
         if valid_mask.sum() < 50:
-            print(f"  Skipping {field_name}: only {valid_mask.sum()} valid samples")
+            logger.info(f"  Skipping {field_name}: only {valid_mask.sum()} valid samples")
             continue
         
         valid_values = field_values[valid_mask]
@@ -459,7 +464,7 @@ def generate_report(
     with open(output_path, "w") as f:
         json.dump(report, f, indent=2)
     
-    print(f"[report] Saved to {output_path}")
+    logger.info(f" Saved to {output_path}")
 
 
 def generate_markdown_report(
@@ -536,7 +541,7 @@ def generate_markdown_report(
     with open(output_path, "w") as f:
         f.write("\n".join(lines))
     
-    print(f"[report] Saved markdown to {output_path}")
+    logger.info(f" Saved markdown to {output_path}")
 
 
 def main():
@@ -576,7 +581,7 @@ def main():
     )
     
     sae = load_sae(Path(args.sae_checkpoint), device)
-    print(f"[model] SAE loaded: {sae.config.d_in} -> {sae.config.d_sae} (k={sae.config.k})")
+    logger.info(f" SAE loaded: {sae.config.d_in} -> {sae.config.d_sae} (k={sae.config.k})")
     
     # Create test dataset
     test_dataset = NuPlanTestDataset(
@@ -618,8 +623,8 @@ def main():
     generate_report(correlations, pure_features, output_dir / "analysis_results.json")
     generate_markdown_report(correlations, pure_features, activations, output_dir / "analysis_report.md")
     
-    print(f"\n[done] Analysis complete!")
-    print(f"  Output: {output_dir}")
+    logger.info(f" Analysis complete!")
+    logger.info(f"  Output: {output_dir}")
 
 
 if __name__ == "__main__":

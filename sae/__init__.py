@@ -26,6 +26,20 @@ from .metrics import (
     compute_temporal_stability,
     run_full_evaluation,
 )
+from .logging_utils import (
+    setup_sae_logging,
+    get_logger,
+    stats,
+    PhaseTimer,
+    EpochStats,
+    GPUMonitor,
+    TimingStats,
+    phase,
+    timed,
+    format_duration,
+    format_bytes,
+    format_throughput,
+)
 
 __all__ = [
     # SAE Model
@@ -53,4 +67,17 @@ __all__ = [
     "compute_temporal_stability",
     # Full Evaluation Suite
     "run_full_evaluation",
+    # Logging & Timing
+    "setup_sae_logging",
+    "get_logger",
+    "stats",
+    "PhaseTimer",
+    "EpochStats",
+    "GPUMonitor",
+    "TimingStats",
+    "phase",
+    "timed",
+    "format_duration",
+    "format_bytes",
+    "format_throughput",
 ]

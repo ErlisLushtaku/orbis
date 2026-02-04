@@ -7,6 +7,7 @@ Implements:
 - Activation Density: Per-feature activation frequency histograms
 """
 
+import time
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 
@@ -20,6 +21,9 @@ import matplotlib.pyplot as plt
 
 from .activation_hooks import ActivationIntervenor, ActivationExtractor, ZeroAblationIntervenor
 from .topk_sae import TopKSAE
+from .logging_utils import get_logger, format_duration
+
+logger = get_logger(__name__)
 
 
 @torch.no_grad()
@@ -650,7 +654,7 @@ def plot_activation_density_histogram(
     
     if save_path:
         fig.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"Saved density histogram to {save_path}")
+        logger.info(f"Saved density histogram to {save_path}")
     
     return fig
 
@@ -691,47 +695,57 @@ def run_full_evaluation(
     output_dir.mkdir(parents=True, exist_ok=True)
     
     results = {}
+    timing = {}
     
     # 1. Loss Recovered
-    print("\n" + "="*60)
-    print("Computing Loss Recovered...")
-    print("="*60)
+    logger.info("=" * 60)
+    logger.info("Computing Loss Recovered...")
+    logger.info("=" * 60)
+    start_time = time.perf_counter()
     loss_results = compute_loss_recovered(
         model, sae, image_dataloader, layer_idx, device,
         t_noise=t_noise, frame_rate=frame_rate, max_batches=max_batches_loss
     )
+    timing["loss_recovered"] = time.perf_counter() - start_time
     results["loss_recovered"] = loss_results
-    print(f"  Baseline Error: {loss_results['baseline_error']:.6f}")
-    print(f"  SAE Error:      {loss_results['sae_error']:.6f}")
-    print(f"  Loss Recovered: {loss_results['loss_recovered']:.4f}")
+    logger.info(f"  Baseline Error: {loss_results['baseline_error']:.6f}")
+    logger.info(f"  SAE Error:      {loss_results['sae_error']:.6f}")
+    logger.info(f"  Loss Recovered: {loss_results['loss_recovered']:.4f}")
+    logger.info(f"  Time: {format_duration(timing['loss_recovered'])}")
     
     # 2. Dead Features
-    print("\n" + "="*60)
-    print("Computing Dead Features...")
-    print("="*60)
+    logger.info("=" * 60)
+    logger.info("Computing Dead Features...")
+    logger.info("=" * 60)
+    start_time = time.perf_counter()
     dead_results = compute_dead_features(
         sae, activation_dataloader, device, max_batches=max_batches_density
     )
+    timing["dead_features"] = time.perf_counter() - start_time
     results["dead_features"] = {
         k: v for k, v in dead_results.items() if k != "dead_indices"
     }
     results["dead_features"]["dead_indices_sample"] = dead_results["dead_indices"][:100]  # Save first 100
-    print(f"  Dead Features:  {dead_results['num_dead']} / {dead_results['total_features']} ({dead_results['dead_fraction']*100:.1f}%)")
-    print(f"  Alive Features: {dead_results['num_alive']}")
+    logger.info(f"  Dead Features:  {dead_results['num_dead']} / {dead_results['total_features']} ({dead_results['dead_fraction']*100:.1f}%)")
+    logger.info(f"  Alive Features: {dead_results['num_alive']}")
+    logger.info(f"  Time: {format_duration(timing['dead_features'])}")
     
     # 3. Activation Density
-    print("\n" + "="*60)
-    print("Computing Activation Density...")
-    print("="*60)
+    logger.info("=" * 60)
+    logger.info("Computing Activation Density...")
+    logger.info("=" * 60)
+    start_time = time.perf_counter()
     density_results = compute_activation_density(
         sae, activation_dataloader, device, max_batches=max_batches_density
     )
+    timing["activation_density"] = time.perf_counter() - start_time
     results["activation_density"] = {
         k: v for k, v in density_results.items() if k != "density_per_feature"
     }
-    print(f"  Mean Density:   {density_results['mean_density']:.4f}")
-    print(f"  Median Density: {density_results['median_density']:.4f}")
-    print(f"  Std Density:    {density_results['std_density']:.4f}")
+    logger.info(f"  Mean Density:   {density_results['mean_density']:.4f}")
+    logger.info(f"  Median Density: {density_results['median_density']:.4f}")
+    logger.info(f"  Std Density:    {density_results['std_density']:.4f}")
+    logger.info(f"  Time: {format_duration(timing['activation_density'])}")
     
     # Plot and save density histogram
     fig = plot_activation_density_histogram(
@@ -745,11 +759,17 @@ def run_full_evaluation(
     np.save(output_dir / "density_per_feature.npy", 
             np.array(density_results["density_per_feature"]))
     
+    # Add timing to results
+    results["timing"] = timing
+    total_time = sum(timing.values())
+    results["timing"]["total"] = total_time
+    
     # Save results
     import json
     with open(output_dir / "evaluation_results.json", "w") as f:
         json.dump(results, f, indent=2)
     
-    print(f"\n[done] Evaluation results saved to {output_dir}")
+    logger.info(f"Evaluation results saved to {output_dir}")
+    logger.info(f"Total evaluation time: {format_duration(total_time)}")
     
     return results

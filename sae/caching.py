@@ -12,6 +12,7 @@ Supports:
 import json
 import os
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union
@@ -23,6 +24,9 @@ from tqdm import tqdm
 from einops import rearrange
 
 from .activation_hooks import ActivationExtractor
+from .logging_utils import get_logger, format_duration, format_bytes, format_throughput
+
+logger = get_logger(__name__)
 
 
 # =============================================================================
@@ -87,7 +91,7 @@ def get_cache_resume_info(
             meta_file.unlink()
         if progress_file.exists():
             progress_file.unlink()
-        print(f"[cache] Rebuild requested. Cleared {cache_dir}")
+        logger.info(f"Rebuild requested. Cleared {cache_dir}")
         return CacheResumeInfo(
             start_batch_idx=0,
             start_sample_idx=0,
@@ -103,7 +107,7 @@ def get_cache_resume_info(
     
     # Handle empty cache (fresh start)
     if not existing_files:
-        print(f"[cache] No existing cache at {cache_dir}")
+        logger.info(f"No existing cache at {cache_dir}")
         return CacheResumeInfo(
             start_batch_idx=0,
             start_sample_idx=0,
@@ -131,7 +135,7 @@ def get_cache_resume_info(
             
             # Check if complete
             if meta["num_files"] == num_existing and num_existing >= total_batches:
-                print(f"[cache] Using complete existing cache from {cache_dir} ({num_existing} files)")
+                logger.info(f"Using complete existing cache from {cache_dir} ({num_existing} files)")
                 return CacheResumeInfo(
                     start_batch_idx=num_existing,
                     start_sample_idx=total_samples,  # All samples processed
@@ -141,10 +145,10 @@ def get_cache_resume_info(
                     valid_files=existing_files,
                 )
         except json.JSONDecodeError:
-            print("[cache] Metadata corrupted, re-scanning files.")
+            logger.warning("Metadata corrupted, re-scanning files.")
     
     # === GAP DETECTION & RESUME LOGIC ===
-    print(f"[cache] Found {num_existing} existing files. Verifying integrity...")
+    logger.info(f"Found {num_existing} existing files. Verifying integrity...")
     
     # Get actual indices present on disk
     actual_indices = sorted([int(f.stem.split('_')[1]) for f in existing_files])
@@ -166,7 +170,7 @@ def get_cache_resume_info(
             valid_files = existing_files
         else:
             # Gap detected!
-            print(f"[cache] WARNING: Gap detected at batch index {first_gap}. Resuming from there.")
+            logger.warning(f"Gap detected at batch index {first_gap}. Resuming from there.")
             start_batch_idx = first_gap
             valid_files = [f for f in existing_files if int(f.stem.split('_')[1]) < first_gap]
     
@@ -188,17 +192,17 @@ def get_cache_resume_info(
                 if progress_num_files == num_files:
                     total_tokens = progress["total_tokens"]
                     hidden_dim = progress.get("hidden_dim")
-                    print(f"[cache] Loaded progress: {total_tokens:,} tokens from {num_files} files")
+                    logger.info(f"Loaded progress: {total_tokens:,} tokens from {num_files} files")
                 else:
-                    print(f"[cache] Progress file stale ({progress_num_files} vs {num_files} files), re-scanning...")
+                    logger.info(f"Progress file stale ({progress_num_files} vs {num_files} files), re-scanning...")
                     progress_file.unlink()  # Remove stale progress
             except (json.JSONDecodeError, KeyError) as e:
-                print(f"[cache] Progress file corrupted ({e}), re-scanning...")
+                logger.warning(f"Progress file corrupted ({e}), re-scanning...")
                 progress_file.unlink()
         
         # If we still need to recover tokens (no valid progress file), scan all files
         if total_tokens == 0:
-            print(f"[cache] Recovering token counts from {num_files} files...")
+            logger.info(f"Recovering token counts from {num_files} files...")
             for f in tqdm(valid_files, desc="Scanning cache", leave=False):
                 try:
                     data = torch.load(f, map_location="cpu", weights_only=True)
@@ -210,7 +214,7 @@ def get_cache_resume_info(
                     if hidden_dim is None:
                         hidden_dim = acts.shape[-1]
                 except Exception as e:
-                    print(f"[cache] Warning: Error reading {f}: {e}. Truncating cache here.")
+                    logger.warning(f"Error reading {f}: {e}. Truncating cache here.")
                     corrupt_idx = int(f.stem.split('_')[1])
                     start_batch_idx = corrupt_idx
                     valid_files = [p for p in valid_files if int(p.stem.split('_')[1]) < corrupt_idx]
@@ -231,10 +235,10 @@ def get_cache_resume_info(
     is_complete = start_batch_idx >= total_batches
     
     if is_complete:
-        print(f"[cache] Cache covers all {total_batches} batches. Nothing to do.")
+        logger.info(f"Cache covers all {total_batches} batches. Nothing to do.")
     else:
-        print(f"[cache] Will resume from batch {start_batch_idx}/{total_batches} "
-              f"(sample {start_sample_idx}/{total_samples}, {total_tokens:,} tokens cached)")
+        logger.info(f"Will resume from batch {start_batch_idx}/{total_batches} "
+                    f"(sample {start_sample_idx}/{total_samples}, {total_tokens:,} tokens cached)")
     
     return CacheResumeInfo(
         start_batch_idx=start_batch_idx,
@@ -449,11 +453,11 @@ def prepare_activation_cache(
     
     # Early return if nothing to do
     if num_new_batches == 0:
-        print(f"[cache] Nothing to cache (dataloader is empty)")
+        logger.info("Nothing to cache (dataloader is empty)")
         return saved_paths
     
-    print(f"[cache] Caching {num_new_batches} batches "
-          f"(batch {start_batch_idx} to {total_batches - 1}) to {cache_dir}")
+    logger.info(f"Caching {num_new_batches} batches "
+                f"(batch {start_batch_idx} to {total_batches - 1}) to {cache_dir}")
     
     # Setup model and extractor
     model.eval()
@@ -582,7 +586,7 @@ def prepare_activation_cache(
     if progress_file.exists():
         progress_file.unlink()
     
-    print(f"[cache] Completed. Total: {len(saved_paths)} files with {total_tokens:,} tokens")
+    logger.info(f"Completed. Total: {len(saved_paths)} files with {total_tokens:,} tokens")
     
     return sorted(saved_paths)
 
@@ -610,7 +614,7 @@ def load_activation_cache(cache_dir: Path) -> Tuple[List[Path], Dict]:
     
     if len(files) != meta["num_files"]:
         # Warning instead of error to support partial caches during debugging
-        print(f"[cache] Warning: Metadata says {meta['num_files']} files, but found {len(files)}.")
+        logger.warning(f"Metadata says {meta['num_files']} files, but found {len(files)}.")
     
     return files, meta
 
@@ -630,7 +634,7 @@ class InMemoryActivationDataset(Dataset):
     ) -> None:
         super().__init__()
         
-        print(f"[cache] Loading {len(files)} files into memory...")
+        logger.info(f"Loading {len(files)} files into memory...")
         
         # Load all activations into a single tensor
         all_activations = []
@@ -649,12 +653,13 @@ class InMemoryActivationDataset(Dataset):
         
         # Truncate if max_tokens specified
         if max_tokens is not None and max_tokens < total_tokens:
-            print(f"[cache] Truncating from {total_tokens:,} to {max_tokens:,} tokens")
+            logger.info(f"Truncating from {total_tokens:,} to {max_tokens:,} tokens")
             self.activations = self.activations[:max_tokens]
         
-        print(f"[cache] Loaded {self.activations.shape[0]:,} tokens, "
-              f"shape={self.activations.shape}, "
-              f"memory={self.activations.numel() * 4 / 1e9:.2f} GB")
+        memory_gb = self.activations.numel() * self.activations.element_size() / 1e9
+        logger.info(f"Loaded {self.activations.shape[0]:,} tokens, "
+                    f"shape={self.activations.shape}, "
+                    f"memory={memory_gb:.2f} GB")
     
     def __len__(self) -> int:
         return self.activations.shape[0]
@@ -702,7 +707,7 @@ def create_activation_dataloader(
         # Slower: stream from disk
         dataset = StreamingActivationDataset(files, total_tokens=total_tokens)
         if max_tokens is not None:
-            print(f"[warning] max_tokens not supported in streaming mode, using all {total_tokens:,} tokens")
+            logger.warning(f"max_tokens not supported in streaming mode, using all {total_tokens:,} tokens")
     
     # Update meta with actual tokens used
     meta = meta.copy()

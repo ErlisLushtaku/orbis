@@ -2,18 +2,27 @@
 """Extract a NuPlan video to MP4 format for visualization."""
 
 import argparse
+import logging
 import h5py
 import numpy as np
 from pathlib import Path
 
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
 def inspect_h5_structure(h5_path: str):
     """Inspect the structure of an HDF5 file."""
-    print(f"\n=== Inspecting: {h5_path} ===")
+    logger.info(f"=== Inspecting: {h5_path} ===")
     with h5py.File(h5_path, 'r') as f:
         def print_attrs(name, obj):
-            print(f"  {name}: {type(obj)}")
+            logger.info(f"  {name}: {type(obj)}")
             if isinstance(obj, h5py.Dataset):
-                print(f"    shape: {obj.shape}, dtype: {obj.dtype}")
+                logger.info(f"    shape: {obj.shape}, dtype: {obj.dtype}")
         f.visititems(print_attrs)
 
 def extract_video_to_mp4(video_dir: str, output_path: str = None, fps: int = 10, max_frames: int = None):
@@ -36,27 +45,27 @@ def extract_video_to_mp4(video_dir: str, output_path: str = None, fps: int = 10,
     if output_path is None:
         output_path = video_dir.parent / f"{video_dir.name}.mp4"
     
-    print(f"Reading frames from: {frames_h5}")
+    logger.info(f"Reading frames from: {frames_h5}")
     
     with h5py.File(frames_h5, 'r') as f:
         # Check structure - nuPlan stores frames in chunks
         keys = sorted(f.keys())
-        print(f"HDF5 keys: {keys}")
+        logger.info(f"HDF5 keys: {keys}")
         
         # Read first chunk to get frame dimensions
         first_chunk = f[keys[0]][:]
         _, height, width, channels = first_chunk.shape
-        print(f"Frame dimensions: {width}x{height}, {channels} channels")
+        logger.info(f"Frame dimensions: {width}x{height}, {channels} channels")
         
         # Calculate total frames
         total_frames = sum(f[k].shape[0] for k in keys)
-        print(f"Total frames: {total_frames}")
+        logger.info(f"Total frames: {total_frames}")
         
         if max_frames:
             total_frames = min(total_frames, max_frames)
         
-        print(f"Extracting {total_frames} frames at {fps} FPS")
-        print(f"Duration: {total_frames / fps:.1f} seconds")
+        logger.info(f"Extracting {total_frames} frames at {fps} FPS")
+        logger.info(f"Duration: {total_frames / fps:.1f} seconds")
         
         # Create video writer
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -79,11 +88,11 @@ def extract_video_to_mp4(video_dir: str, output_path: str = None, fps: int = 10,
                 frame_count += 1
                 
                 if frame_count % 200 == 0:
-                    print(f"  Processed {frame_count}/{total_frames} frames")
+                    logger.info(f"  Processed {frame_count}/{total_frames} frames")
         
         out.release()
     
-    print(f"\nSaved video to: {output_path}")
+    logger.info(f"Saved video to: {output_path}")
     return str(output_path)
 
 

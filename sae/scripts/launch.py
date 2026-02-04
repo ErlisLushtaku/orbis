@@ -28,12 +28,21 @@ Usage:
 
 import argparse
 import json
+import logging
 import os
 import re
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 
 # =============================================================================
@@ -74,7 +83,7 @@ def confirm(message: str, default: bool = False) -> bool:
             return default
         return response in ("y", "yes")
     except (EOFError, KeyboardInterrupt):
-        print("\nAborted.")
+        logger.info("Aborted.")
         sys.exit(1)
 
 
@@ -174,24 +183,24 @@ def submit_job(
     cmd.extend(args)
     
     if dry_run:
-        print(f"[DRY RUN] {' '.join(cmd)}")
+        logger.info(f"[DRY RUN] {' '.join(cmd)}")
         return ""
     
-    print(f"[SUBMIT] {' '.join(cmd)}")
+    logger.info(f"Submitting: {' '.join(cmd)}")
     result = subprocess.run(cmd, capture_output=True, text=True)
     
     if result.returncode != 0:
-        print(f"[ERROR] sbatch failed: {result.stderr}")
+        logger.error(f"sbatch failed: {result.stderr}")
         sys.exit(1)
     
     # Parse job ID from output like "Submitted batch job 12345"
     match = re.search(r"Submitted batch job (\d+)", result.stdout)
     if match:
         job_id = match.group(1)
-        print(f"[OK] Job submitted: {job_id}")
+        logger.info(f"Job submitted: {job_id}")
         return job_id
     else:
-        print(f"[WARNING] Could not parse job ID from: {result.stdout}")
+        logger.warning(f"Could not parse job ID from: {result.stdout}")
         return ""
 
 
@@ -249,15 +258,15 @@ def main():
     
     # Validate arguments
     if args.cache_only and args.train_only:
-        print("[ERROR] Cannot specify both --cache_only and --train_only")
+        logger.error("Cannot specify both --cache_only and --train_only")
         sys.exit(1)
     
     # Check script existence
     if not CACHE_SCRIPT.exists():
-        print(f"[ERROR] Cache script not found: {CACHE_SCRIPT}")
+        logger.error(f"Cache script not found: {CACHE_SCRIPT}")
         sys.exit(1)
     if not TRAIN_SCRIPT.exists():
-        print(f"[ERROR] Train script not found: {TRAIN_SCRIPT}")
+        logger.error(f"Train script not found: {TRAIN_SCRIPT}")
         sys.exit(1)
     
     # Get cache directory and check status
@@ -270,49 +279,46 @@ def main():
     val_cache_exists = (cache_dir / "val").exists() and any((cache_dir / "val").glob("batch_*.pt"))
     partial_cache_exists = (train_cache_exists or val_cache_exists) and not cache_complete
     
-    print(f"=== SAE Training Orchestrator ===")
-    print(f"Data source: {args.data_source}")
-    print(f"Layer: {args.layer}")
-    print(f"Cache directory: {cache_dir}")
-    print(f"Cache status: {'COMPLETE' if cache_complete else 'INCOMPLETE'}")
+    logger.info("=== SAE Training Orchestrator ===")
+    logger.info(f"Data source: {args.data_source}")
+    logger.info(f"Layer: {args.layer}")
+    logger.info(f"Cache directory: {cache_dir}")
+    logger.info(f"Cache status: {'COMPLETE' if cache_complete else 'INCOMPLETE'}")
     
     # Show cache info if available
     if cache_info["train"]:
-        print(f"  Train: {cache_info['train']['num_files']} files, {cache_info['train']['total_tokens']:,} tokens")
+        logger.info(f"  Train: {cache_info['train']['num_files']} files, {cache_info['train']['total_tokens']:,} tokens")
     if cache_info["val"]:
-        print(f"  Val: {cache_info['val']['num_files']} files, {cache_info['val']['total_tokens']:,} tokens")
-    print()
+        logger.info(f"  Val: {cache_info['val']['num_files']} files, {cache_info['val']['total_tokens']:,} tokens")
     
     # === Confirmation prompts ===
     
     # Confirm rebuild_cache (destructive operation)
     if args.rebuild_cache and not args.dry_run:
         if cache_complete or partial_cache_exists:
-            print("[WARNING] --rebuild_cache will DELETE the existing cache!")
+            logger.warning("--rebuild_cache will DELETE the existing cache!")
             if cache_info["train"]:
-                print(f"  This will delete {cache_info['train']['num_files']} train files ({cache_info['train']['total_tokens']:,} tokens)")
+                logger.warning(f"  This will delete {cache_info['train']['num_files']} train files ({cache_info['train']['total_tokens']:,} tokens)")
             if cache_info["val"]:
-                print(f"  This will delete {cache_info['val']['num_files']} val files ({cache_info['val']['total_tokens']:,} tokens)")
+                logger.warning(f"  This will delete {cache_info['val']['num_files']} val files ({cache_info['val']['total_tokens']:,} tokens)")
             
             if not args.yes:
                 if not confirm("Are you sure you want to rebuild the cache?"):
-                    print("Aborted.")
+                    logger.info("Aborted.")
                     sys.exit(0)
-            print()
     
     # Confirm cache resume (resuming partial cache)
     if partial_cache_exists and not args.rebuild_cache and not args.train_only and not args.dry_run:
-        print("[INFO] Found incomplete cache. Will resume from existing progress.")
+        logger.info("Found incomplete cache. Will resume from existing progress.")
         if cache_info["train"]:
-            print(f"  Train: {cache_info['train']['num_files']} files already cached")
+            logger.info(f"  Train: {cache_info['train']['num_files']} files already cached")
         if cache_info["val"]:
-            print(f"  Val: {cache_info['val']['num_files']} files already cached")
+            logger.info(f"  Val: {cache_info['val']['num_files']} files already cached")
         
         if not args.yes:
             if not confirm("Continue with cache resume?", default=True):
-                print("Aborted. Use --rebuild_cache to start fresh.")
+                logger.info("Aborted. Use --rebuild_cache to start fresh.")
                 sys.exit(0)
-        print()
     
     # Determine what to do
     need_cache = not cache_complete or args.rebuild_cache
@@ -320,9 +326,9 @@ def main():
     skip_cache = args.train_only
     
     if skip_cache and not cache_complete:
-        print("[ERROR] --train_only specified but cache is incomplete")
-        print(f"  Train meta: {cache_dir / 'train' / '_meta.json'}")
-        print(f"  Val meta: {cache_dir / 'val' / '_meta.json'}")
+        logger.error("--train_only specified but cache is incomplete")
+        logger.error(f"  Train meta: {cache_dir / 'train' / '_meta.json'}")
+        logger.error(f"  Val meta: {cache_dir / 'val' / '_meta.json'}")
         sys.exit(1)
     
     cache_job_id = None
@@ -346,7 +352,7 @@ def main():
         if args.rebuild_cache:
             cache_args.append("--rebuild_cache")
         
-        print(f"[CACHE] Submitting cache job: {cache_id}")
+        logger.info(f"Submitting cache job: {cache_id}")
         cache_job_id = submit_job(
             script_path=CACHE_SCRIPT,
             args=cache_args,
@@ -355,7 +361,6 @@ def main():
             error_path=cache_log_dir / f"{cache_id}.err",
             dry_run=args.dry_run,
         )
-        print()
     
     # Submit train job if needed
     if need_train:
@@ -384,9 +389,9 @@ def main():
         # Set dependency if cache job was submitted
         dependency = f"afterok:{cache_job_id}" if cache_job_id else None
         
-        print(f"[TRAIN] Submitting train job: {train_barcode}")
+        logger.info(f"Submitting train job: {train_barcode}")
         if dependency:
-            print(f"  Dependency: {dependency}")
+            logger.info(f"  Dependency: {dependency}")
         
         train_job_id = submit_job(
             script_path=TRAIN_SCRIPT,
@@ -397,19 +402,17 @@ def main():
             dependency=dependency,
             dry_run=args.dry_run,
         )
-        print()
     
     # Summary
-    print("=== Summary ===")
+    logger.info("=== Summary ===")
     if cache_job_id:
-        print(f"Cache job: {cache_job_id}")
+        logger.info(f"Cache job: {cache_job_id}")
     if train_job_id:
-        print(f"Train job: {train_job_id}")
+        logger.info(f"Train job: {train_job_id}")
     if not cache_job_id and not train_job_id:
-        print("No jobs submitted (dry run or nothing to do)")
+        logger.info("No jobs submitted (dry run or nothing to do)")
     
-    print()
-    print("Monitor jobs with: squeue -u $USER")
+    logger.info("Monitor jobs with: squeue -u $USER")
     
 
 if __name__ == "__main__":

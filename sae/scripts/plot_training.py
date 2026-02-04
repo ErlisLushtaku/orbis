@@ -16,11 +16,20 @@ Plots are saved in a 'plots' subdirectory next to history.json.
 
 import argparse
 import json
+import logging
 from pathlib import Path
 from typing import Dict, List, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 
 def load_history(history_path: Path) -> List[Dict]:
@@ -100,7 +109,7 @@ def plot_metric(
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"  Saved: {output_path}")
+    logger.info(f"Saved: {output_path}")
 
 
 def plot_all_metrics(
@@ -114,7 +123,7 @@ def plot_all_metrics(
     n_metrics = len(all_metrics)
     
     if n_metrics == 0:
-        print("No metrics to plot!")
+        logger.warning("No metrics to plot!")
         return
     
     # Create subplot grid
@@ -172,7 +181,7 @@ def plot_all_metrics(
     output_path = output_dir / "all_metrics.png"
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"  Saved: {output_path}")
+    logger.info(f"Saved: {output_path}")
 
 
 def plot_history(history_path: Path) -> Path:
@@ -195,8 +204,8 @@ def plot_history(history_path: Path) -> Path:
     plots_dir.mkdir(exist_ok=True)
     
     run_name = run_dir.name
-    print(f"\nPlotting metrics for: {run_name}")
-    print(f"Output directory: {plots_dir}")
+    logger.info(f"Plotting metrics for: {run_name}")
+    logger.info(f"Output directory: {plots_dir}")
     
     # Load and extract metrics
     history = load_history(history_path)
@@ -246,7 +255,7 @@ def main():
         try:
             plot_history(history_path)
         except Exception as e:
-            print(f"Error processing {history_path}: {e}")
+            logger.error(f"Error processing {history_path}: {e}")
 
 
 if __name__ == "__main__":

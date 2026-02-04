@@ -47,6 +47,11 @@ if str(ORBIS_ROOT) not in sys.path:
 
 from omegaconf import OmegaConf
 from util import instantiate_from_config
+from sae.logging_utils import get_logger, setup_sae_logging
+
+# Setup logging
+setup_sae_logging()
+logger = get_logger(__name__)
 
 # Local imports (use absolute imports for script execution)
 from sae.topk_sae import TopKSAE
@@ -325,7 +330,7 @@ def generate_feature_dashboard(
     extractor = ActivationExtractor(model, layer_idx=layer_idx, flatten_spatial=False)
     tracker = FeatureTracker(sae.d_sae, top_k=frames_per_latent)
     
-    print(f"[dashboard] Scanning dataset for top activations...")
+    logger.info(f" Scanning dataset for top activations...")
     
     global_frame_idx = 0
     
@@ -420,7 +425,7 @@ def generate_feature_dashboard(
             )
     
     # Get top features
-    print(f"\n[dashboard] Generating visualizations for top {num_latents} features...")
+    logger.info(f" Generating visualizations for top {num_latents} features...")
     top_features = tracker.get_top_features(num_latents)
     
     # Determine grid size
@@ -469,28 +474,28 @@ def generate_feature_dashboard(
     with open(output_dir / "dashboard_summary.json", "w") as f:
         json.dump(summary, f, indent=2)
     
-    print(f"\n[done] Feature dashboard saved to {output_dir}")
-    print(f"  Visualized {len(feature_info)} features")
-    print(f"  Top feature: #{top_features[0]} with activation mass {tracker.feature_total_activation[top_features[0]]:.2f}")
+    logger.info(f" Feature dashboard saved to {output_dir}")
+    logger.info(f"  Visualized {len(feature_info)} features")
+    logger.info(f"  Top feature: #{top_features[0]} with activation mass {tracker.feature_total_activation[top_features[0]]:.2f}")
 
 
 def main(args):
     """Main function for feature dashboard generation."""
 
     device = torch.device(args.device)
-    print(f"[setup] Using device: {device}")
+    logger.info(f" Using device: {device}")
 
     # Load SAE
-    print(f"[model] Loading SAE from {args.sae_checkpoint}")
+    logger.info(f" Loading SAE from {args.sae_checkpoint}")
     sae = TopKSAE.load(args.sae_checkpoint, device=device)
-    print(f"[model] SAE: {sae}")
+    logger.info(f" SAE: {sae}")
 
     # Load Orbis model
     exp_dir = Path(args.exp_dir)
     config_path = exp_dir / args.config
     ckpt_path = exp_dir / args.ckpt
 
-    print(f"[model] Loading Orbis from {exp_dir}")
+    logger.info(f" Loading Orbis from {exp_dir}")
     cfg_model = OmegaConf.load(config_path)
     model = instantiate_from_config(cfg_model.model)
     state_dict = torch.load(ckpt_path, map_location="cpu")["state_dict"]

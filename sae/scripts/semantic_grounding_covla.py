@@ -45,8 +45,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from sae.topk_sae import TopKSAE, TopKSAEConfig
 from sae.activation_hooks import ActivationExtractor
 from sae.caching import prepare_activation_cache, load_activation_cache, resolve_cache_dtype
+from sae.logging_utils import get_logger, setup_sae_logging
 from data.covla.covla_dataset import CoVLAOrbisMultiFrame
 from util import instantiate_from_config
+
+# Setup logging
+setup_sae_logging()
+logger = get_logger(__name__)
 
 
 # Metadata fields to analyze (confidence scores)
@@ -102,14 +107,14 @@ def load_orbis_model(
     """Load the frozen Orbis world model."""
     from omegaconf import OmegaConf
     
-    print(f"[model] Loading config from {config_path}")
+    logger.info(f" Loading config from {config_path}")
     cfg_model = OmegaConf.load(config_path)
     
-    print(f"[model] Instantiating model...")
+    logger.info(f" Instantiating model...")
     model = instantiate_from_config(cfg_model.model)
     
     # Load checkpoint
-    print(f"[model] Loading checkpoint from {ckpt_path}")
+    logger.info(f" Loading checkpoint from {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     if "state_dict" in ckpt:
         state_dict = ckpt["state_dict"]
@@ -125,7 +130,7 @@ def load_orbis_model(
     for param in model.parameters():
         param.requires_grad = False
     
-    print(f"[model] Model loaded and frozen")
+    logger.info(f" Model loaded and frozen")
     return model
 
 
@@ -205,7 +210,7 @@ class TestDataset(torch.utils.data.Dataset):
         if split_file:
             with open(split_file, 'r') as f:
                 self.video_ids = [json.loads(line)["video_id"] for line in f]
-            print(f"[test_data] Loaded {len(self.video_ids)} video IDs from split file")
+            logger.info(f" Loaded {len(self.video_ids)} video IDs from split file")
         else:
             video_files = sorted(self.videos_dir.glob("*.mp4"))
             self.video_ids = [v.stem for v in video_files]
@@ -220,7 +225,7 @@ class TestDataset(torch.utils.data.Dataset):
         # Minimum frame index to have enough context frames
         min_frame_for_context = (self.num_frames - 1) * self.frame_interval
         
-        print(f"[test_data] Indexing {len(self.video_ids)} test videos (context={num_frames-1}, target=1)...")
+        logger.info(f" Indexing {len(self.video_ids)} test videos (context={num_frames-1}, target=1)...")
         for video_id in tqdm(self.video_ids, desc="Indexing"):
             video_path = self.videos_dir / f"{video_id}.mp4"
             try:
@@ -230,9 +235,9 @@ class TestDataset(torch.utils.data.Dataset):
                 for target_frame_idx in range(min_frame_for_context, total_frames, self.frame_interval):
                     self.clip_index.append((video_id, target_frame_idx))
             except Exception as e:
-                print(f"Warning: Could not read {video_path}: {e}")
+                logger.warning(f" Could not read {video_path}: {e}")
         
-        print(f"[test_data] Total clips to process: {len(self.clip_index)}")
+        logger.info(f" Total clips to process: {len(self.clip_index)}")
         
         # Setup transforms (aspect-ratio aware resize + center crop)
         source_size = (1928, 1208)  # CoVLA resolution (W, H)
@@ -320,7 +325,7 @@ def save_sample_metadata(
     """Save per-sample metadata alongside Orbis activation cache."""
     metadata_path = cache_dir / "_sample_metadata.pt"
     torch.save({"samples": metadata_list, "num_samples": len(metadata_list)}, metadata_path)
-    print(f"[cache] Saved metadata for {len(metadata_list)} samples to {metadata_path}")
+    logger.info(f" Saved metadata for {len(metadata_list)} samples to {metadata_path}")
 
 
 def load_sample_metadata(cache_dir: Path) -> List[Dict[str, Any]]:
@@ -329,7 +334,7 @@ def load_sample_metadata(cache_dir: Path) -> List[Dict[str, Any]]:
     if not metadata_path.exists():
         raise FileNotFoundError(f"Sample metadata not found at {metadata_path}")
     data = torch.load(metadata_path, weights_only=False)
-    print(f"[cache] Loaded metadata for {data['num_samples']} samples from {metadata_path}")
+    logger.info(f" Loaded metadata for {data['num_samples']} samples from {metadata_path}")
     return data["samples"]
 
 
@@ -376,14 +381,14 @@ def cache_orbis_activations_with_metadata(
     # Check for existing cache
     existing_files = sorted(cache_dir.glob("batch_*.pt"))
     if existing_files and meta_file.exists() and sample_meta_file.exists() and not rebuild:
-        print(f"[cache] Using existing Orbis activation cache from {cache_dir} ({len(existing_files)} files)")
+        logger.info(f" Using existing Orbis activation cache from {cache_dir} ({len(existing_files)} files)")
         sample_metadata = load_sample_metadata(cache_dir)
         return existing_files, sample_metadata
     
     if rebuild:
-        print(f"[cache] Rebuilding Orbis activation cache at {cache_dir}")
+        logger.info(f" Rebuilding Orbis activation cache at {cache_dir}")
     else:
-        print(f"[cache] Creating Orbis activation cache at {cache_dir}")
+        logger.info(f" Creating Orbis activation cache at {cache_dir}")
     
     # Clean stale cache
     for path in cache_dir.glob("batch_*.pt"):
@@ -483,7 +488,7 @@ def cache_orbis_activations_with_metadata(
     # Save sample metadata
     save_sample_metadata(all_sample_metadata, cache_dir)
     
-    print(f"[cache] Saved {len(saved_paths)} files with {total_tokens:,} total tokens")
+    logger.info(f" Saved {len(saved_paths)} files with {total_tokens:,} total tokens")
     
     return sorted(saved_paths), all_sample_metadata
 
@@ -530,7 +535,7 @@ def collect_activations(
         )
         
         # Load cached activations and encode through SAE
-        print(f"[analysis] Encoding cached activations through SAE...")
+        logger.info(f" Encoding cached activations through SAE...")
         all_activations: List[FrameActivation] = []
         sample_idx = 0
         
@@ -641,7 +646,7 @@ def compute_correlations(
     num_latents = activations[0].latent_activations.shape[0]
     num_samples = len(activations)
     
-    print(f"[correlation] Computing correlations for {num_latents} latents across {num_samples} samples")
+    logger.info(f" Computing correlations for {num_latents} latents across {num_samples} samples")
     
     # Build arrays for vectorized computation
     # latent_matrix: (num_samples, num_latents)
@@ -661,7 +666,7 @@ def compute_correlations(
         # Filter out NaN values
         valid_mask = ~np.isnan(field_values)
         if valid_mask.sum() < min_samples:
-            print(f"  Warning: {field_name} has only {valid_mask.sum()} valid samples")
+            logger.info(f"  Warning: {field_name} has only {valid_mask.sum()} valid samples")
             continue
         
         valid_field = field_values[valid_mask]
@@ -811,7 +816,7 @@ def analyze_top_latents(
     """
     from decord import VideoReader, cpu
     
-    print(f"[analysis] Finding top {top_n_latents} latents by {metric} activation...")
+    logger.info(f" Finding top {top_n_latents} latents by {metric} activation...")
     top_latents = find_top_activating_latents(activations, top_n=top_n_latents, metric=metric)
     
     # Create output directory
@@ -863,7 +868,7 @@ def analyze_top_latents(
                     save_path = frame_dir / f"rank{j+1}_{frame_info['video_id']}_frame{frame_info['frame_idx']}.png"
                     img.save(save_path)
                 except Exception as e:
-                    print(f"Warning: Could not save frame: {e}")
+                    logger.warning(f" Could not save frame: {e}")
         
         # Add frames and captions to report
         lines.append("### Top Activating Frames")
@@ -900,7 +905,7 @@ def analyze_top_latents(
     with open(report_path, 'w') as f:
         f.write(report)
     
-    print(f"\n[report] Top latents analysis saved to {report_path}")
+    logger.info(f"report] Top latents analysis saved to {report_path}")
     
     return report
 
@@ -961,7 +966,7 @@ def save_top_frames(
             img.save(save_path)
             saved_paths.append(str(save_path))
         except Exception as e:
-            print(f"Warning: Could not save frame: {e}")
+            logger.warning(f" Could not save frame: {e}")
     
     return saved_paths
 
@@ -1057,7 +1062,7 @@ def generate_report(
     with open(report_path, 'w') as f:
         f.write(report)
     
-    print(f"\n[report] Saved to {report_path}")
+    logger.info(f"report] Saved to {report_path}")
     
     return report
 
@@ -1148,7 +1153,7 @@ def generate_detailed_frame_analysis(
     with open(report_path, 'w') as f:
         f.write(report)
     
-    print(f"\n[report] Detailed frame analysis saved to {report_path}")
+    logger.info(f"report] Detailed frame analysis saved to {report_path}")
     
     return report
 
@@ -1157,24 +1162,24 @@ def main(args: argparse.Namespace):
     """Main analysis function."""
     
     device = torch.device(args.device)
-    print(f"[setup] Using device: {device}")
+    logger.info(f" Using device: {device}")
     
     exp_dir = Path(args.exp_dir)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # Load models
-    print("\n[setup] Loading Orbis model...")
+    logger.info("Loading Orbis model...")
     config_path = exp_dir / args.config
     ckpt_path = exp_dir / args.ckpt
     orbis_model = load_orbis_model(config_path, ckpt_path, device)
     
-    print("\n[setup] Loading SAE...")
+    logger.info("Loading SAE...")
     sae = load_sae(Path(args.sae_checkpoint), device)
-    print(f"  SAE config: d_in={sae.config.d_in}, d_sae={sae.config.d_sae}, k={sae.config.k}")
+    logger.info(f"  SAE config: d_in={sae.config.d_in}, d_sae={sae.config.d_sae}, k={sae.config.k}")
     
     # Create test dataset
-    print("\n[setup] Creating test dataset...")
+    logger.info("Creating test dataset...")
     test_dataset = TestDataset(
         videos_dir=args.test_videos_dir,
         captions_dir=args.test_captions_dir,
@@ -1203,10 +1208,10 @@ def main(args: argparse.Namespace):
             data_source="covla",  # TODO: make this configurable if needed
             layer_idx=args.layer,
         )
-        print(f"[cache] Test activation cache directory: {cache_dir}")
+        logger.info(f" Test activation cache directory: {cache_dir}")
     
     # Collect activations (with caching)
-    print("\n[analysis] Collecting SAE activations...")
+    logger.info("Collecting SAE activations...")
     activations = collect_activations(
         orbis_model=orbis_model,
         sae=sae,
@@ -1219,17 +1224,17 @@ def main(args: argparse.Namespace):
     )
     
     # Compute correlations
-    print("\n[analysis] Computing correlations...")
+    logger.info("Computing correlations...")
     correlations = compute_correlations(activations)
     
     # Find pure features
-    print("\n[analysis] Finding pure features...")
+    logger.info("Finding pure features...")
     pure_features = find_pure_features(
         correlations,
         high_threshold=args.high_threshold,
         low_threshold=args.low_threshold,
     )
-    print(f"  Found {len(pure_features)} pure features")
+    logger.info(f"  Found {len(pure_features)} pure features")
     
     # Save correlation data
     corr_data = {
@@ -1245,7 +1250,7 @@ def main(args: argparse.Namespace):
         json.dump(pure_data, f, indent=2, default=lambda x: x.tolist() if hasattr(x, 'tolist') else x)
     
     # Generate report
-    print("\n[analysis] Generating report...")
+    logger.info("Generating report...")
     report = generate_report(
         correlations=correlations,
         pure_features=pure_features,
@@ -1256,10 +1261,10 @@ def main(args: argparse.Namespace):
         top_latents_per_field=args.top_latents_per_field,
     )
     
-    print("\n" + report)
+    logger.info(f"\n{report}")
     
     # Generate detailed frame analysis with full captions
-    print("\n[analysis] Generating detailed frame analysis...")
+    logger.info("Generating detailed frame analysis...")
     generate_detailed_frame_analysis(
         correlations=correlations,
         activations=activations,
@@ -1269,7 +1274,7 @@ def main(args: argparse.Namespace):
     )
     
     # Analyze top activating latents overall (not tied to metadata)
-    print("\n[analysis] Analyzing top activating latents...")
+    logger.info("Analyzing top activating latents...")
     analyze_top_latents(
         activations=activations,
         videos_dir=Path(args.test_videos_dir),
@@ -1279,7 +1284,7 @@ def main(args: argparse.Namespace):
         metric=args.latent_metric,
     )
     
-    print(f"\n[done] Analysis complete. Results saved to {output_dir}")
+    logger.info(f"done] Analysis complete. Results saved to {output_dir}")
 
 
 def generate_report_from_saved(
@@ -1394,7 +1399,7 @@ def generate_report_from_saved(
     with open(report_path, 'w') as f:
         f.write(report)
     
-    print(f"\n[report] Detailed frame analysis saved to {report_path}")
+    logger.info(f"report] Detailed frame analysis saved to {report_path}")
     
     return report
 
@@ -1475,7 +1480,7 @@ if __name__ == "__main__":
     
     if args.from_saved:
         # Just regenerate the detailed report from saved data
-        print("[mode] Generating detailed report from saved analysis...")
+        logger.info("Generating detailed report from saved analysis...")
         generate_report_from_saved(
             output_dir=Path(args.output_dir),
             captions_dir=Path(args.test_captions_dir),

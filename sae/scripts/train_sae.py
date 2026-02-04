@@ -23,6 +23,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Dict, Optional, Sequence, Tuple
 
@@ -56,6 +57,18 @@ from sae.metrics import (
     compute_normalized_loss_recovered,
     compute_dictionary_coverage,
 )
+from sae.logging_utils import (
+    setup_sae_logging,
+    get_logger,
+    stats,
+    PhaseTimer,
+    EpochStats,
+    GPUMonitor,
+    format_duration,
+    format_bytes,
+)
+
+logger = get_logger(__name__)
 
 # Import datasets
 from semantic_stage2 import CityScapes
@@ -84,13 +97,13 @@ def load_orbis_model(
     Returns:
         Loaded model in eval mode with frozen parameters
     """
-    print(f"[model] Loading config from {config_path}")
+    logger.info(f"Loading config from {config_path}")
     cfg_model = OmegaConf.load(config_path)
 
-    print(f"[model] Instantiating model...")
+    logger.info("Instantiating model...")
     model = instantiate_from_config(cfg_model.model)
 
-    print(f"[model] Loading checkpoint from {ckpt_path}")
+    logger.info(f"Loading checkpoint from {ckpt_path}")
     state_dict = torch.load(ckpt_path, map_location="cpu")["state_dict"]
     model.load_state_dict(state_dict, strict=False)
 
@@ -100,7 +113,7 @@ def load_orbis_model(
     for param in model.parameters():
         param.requires_grad = False
 
-    print(f"[model] Model loaded and frozen")
+    logger.info("Model loaded and frozen")
     return model
 
 
@@ -183,7 +196,7 @@ def create_dataloaders_image_paths(
     train_loader = DataLoader(dataset, shuffle=False, **loader_kwargs)
     val_loader = DataLoader(dataset, shuffle=False, **loader_kwargs)
     
-    print(f"[data] Image paths dataset: {len(dataset)} samples, {len(image_paths)} frames")
+    logger.info(f"Image paths dataset: {len(dataset)} samples, {len(image_paths)} frames")
     
     return train_loader, val_loader
 
@@ -249,8 +262,8 @@ def create_dataloaders_hdf5(
     train_loader = DataLoader(dataset_train, shuffle=False, **loader_kwargs)
     val_loader = DataLoader(dataset_val, shuffle=False, **loader_kwargs)
 
-    print(f"[data] HDF5 train dataset: {len(dataset_train)} samples")
-    print(f"[data] HDF5 val dataset: {len(dataset_val)} samples")
+    logger.info(f"HDF5 train dataset: {len(dataset_train)} samples")
+    logger.info(f"HDF5 val dataset: {len(dataset_val)} samples")
 
     return train_loader, val_loader
 
@@ -310,9 +323,9 @@ def create_datasets_covla(
     dataset_train = Subset(full_dataset, train_indices)
     dataset_val = Subset(full_dataset, val_indices)
 
-    print(f"[data] CoVLA Full: {total_videos} videos, {len(full_dataset)} total clips")
-    print(f"[data] Train Split: {num_train_videos} videos ({len(dataset_train)} clips)")
-    print(f"[data] Val Split:   {num_val_videos} videos ({len(dataset_val)} clips)")
+    logger.info(f"CoVLA Full: {total_videos} videos, {len(full_dataset)} total clips")
+    logger.info(f"Train Split: {num_train_videos} videos ({len(dataset_train)} clips)")
+    logger.info(f"Val Split:   {num_val_videos} videos ({len(dataset_val)} clips)")
 
     return dataset_train, dataset_val
 
@@ -423,9 +436,9 @@ def create_datasets_nuplan(
     dataset_train = Subset(full_dataset, train_indices)
     dataset_val = Subset(full_dataset, val_indices)
 
-    print(f"[data] NuPlan Full: {total_videos} videos, {len(full_dataset)} total clips")
-    print(f"[data] Train Split: {num_train_videos} videos ({len(dataset_train)} clips)")
-    print(f"[data] Val Split:   {num_val_videos} videos ({len(dataset_val)} clips)")
+    logger.info(f"NuPlan Full: {total_videos} videos, {len(full_dataset)} total clips")
+    logger.info(f"Train Split: {num_train_videos} videos ({len(dataset_train)} clips)")
+    logger.info(f"Val Split:   {num_val_videos} videos ({len(dataset_val)} clips)")
 
     return dataset_train, dataset_val
 
@@ -503,7 +516,7 @@ def create_dataloader_with_offset(
         else:
             remaining_indices = range(start_sample_idx, len(dataset))
         dataset = Subset(dataset, remaining_indices)
-        print(f"[data] Applied resume subset: {len(dataset)} samples remaining")
+        logger.info(f"Applied resume subset: {len(dataset)} samples remaining")
     
     loader_kwargs = dict(
         batch_size=batch_size,
@@ -597,7 +610,7 @@ def create_dataloaders(
             )
         # CoVLA videos are stored at 20 FPS - enforce this to avoid errors
         if stored_data_frame_rate != 20:
-            print(f"[warning] CoVLA videos are 20 FPS, but stored_frame_rate={stored_data_frame_rate}. Forcing to 20.")
+            logger.warning(f"CoVLA videos are 20 FPS, but stored_frame_rate={stored_data_frame_rate}. Forcing to 20.")
             stored_data_frame_rate = 20
         return create_dataloaders_covla(
             videos_dir=covla_videos_dir,
@@ -618,7 +631,7 @@ def create_dataloaders(
             )
         # NuPlan videos are stored at 10 FPS - enforce this to avoid errors
         if stored_data_frame_rate != 10:
-            print(f"[warning] NuPlan videos are 10 FPS, but stored_frame_rate={stored_data_frame_rate}. Forcing to 10.")
+            logger.warning(f"NuPlan videos are 10 FPS, but stored_frame_rate={stored_data_frame_rate}. Forcing to 10.")
             stored_data_frame_rate = 10
         return create_dataloaders_nuplan(
             data_dir=nuplan_data_dir,
@@ -642,8 +655,16 @@ def train_epoch(
     dataloader: DataLoader,
     epoch: int,
     total_epochs: int,
-) -> Dict[str, float]:
-    """Train for one epoch with full Phase 1 metric logging."""
+    gpu_monitor: Optional[GPUMonitor] = None,
+) -> Tuple[Dict[str, float], EpochStats]:
+    """
+    Train for one epoch with full Phase 1 metric logging and IO wait tracking.
+    
+    Returns:
+        Tuple of (averaged metrics dict, EpochStats with IO timing)
+    """
+    # Initialize epoch stats for IO wait tracking
+    epoch_stats = EpochStats(epoch_num=epoch)
     
     # All Phase 1 metrics to track
     metrics_sum = {
@@ -658,25 +679,65 @@ def train_epoch(
     }
     num_batches = 0
     
-    pbar = tqdm(dataloader, desc=f"Epoch {epoch}/{total_epochs} [train]", 
-                 file=sys.stdout, mininterval=360.0)  # Write to stdout, update every 30s
-    for batch in pbar:
+    # Set GPU monitor phase
+    if gpu_monitor is not None:
+        gpu_monitor.set_phase(f"train_epoch_{epoch}")
+    
+    # Create iterator for IO wait timing
+    data_iter = iter(dataloader)
+    pbar = tqdm(range(len(dataloader)), desc=f"Epoch {epoch}/{total_epochs} [train]", 
+                file=sys.stdout, mininterval=360.0)
+    
+    for _ in pbar:
+        # Time IO wait (how long we wait for the next batch)
+        io_start = time.perf_counter()
+        try:
+            batch = next(data_iter)
+        except StopIteration:
+            break
+        io_wait = time.perf_counter() - io_start
+        
+        # Time compute (actual training step)
+        compute_start = time.perf_counter()
         metrics = trainer.train_step(batch)
+        compute_time = time.perf_counter() - compute_start
+        
+        # Record batch timing
+        batch_size = batch.shape[0] if hasattr(batch, 'shape') else len(batch)
+        epoch_stats.add_batch(
+            io_wait=io_wait,
+            compute_time=compute_time,
+            batch_size=batch_size,
+            loss=metrics.get('loss', 0.0),
+        )
         
         for k in metrics_sum.keys():
             if k in metrics:
                 metrics_sum[k] += metrics[k]
         num_batches += 1
         
-        # Display key metrics in progress bar: loss, l0, dead%
+        # Display key metrics in progress bar: loss, l0, dead%, io_wait%
+        io_pct = (epoch_stats.io_wait_time / epoch_stats.total_time * 100) if epoch_stats.total_time > 0 else 0
         pbar.set_postfix({
             "loss": f"{metrics['loss']:.4f}",
             "l0": f"{metrics['l0']:.1f}",
             "dead%": f"{metrics['dead_pct']:.1f}",
+            "io%": f"{io_pct:.1f}",
         })
     
+    # Collect GPU stats for this epoch
+    if gpu_monitor is not None:
+        gpu_stats = gpu_monitor.get_phase_stats(f"train_epoch_{epoch}")
+        if 'avg_util_pct' in gpu_stats:
+            epoch_stats.gpu_util_samples.append(gpu_stats['avg_util_pct'])
+        if 'peak_memory_gb' in gpu_stats:
+            epoch_stats.gpu_memory_samples.append(gpu_stats['peak_memory_gb'] * 1e9)
+        gpu_monitor.clear_phase()
+    
     # Average metrics
-    return {k: v / num_batches for k, v in metrics_sum.items()}
+    avg_metrics = {k: v / num_batches for k, v in metrics_sum.items()} if num_batches > 0 else metrics_sum
+    
+    return avg_metrics, epoch_stats
 
 
 @torch.no_grad()
@@ -699,6 +760,7 @@ def eval_epoch(
     }
     num_batches = 0
     
+    eval_start = time.perf_counter()
     for batch in tqdm(dataloader, desc="Evaluating", file=sys.stdout, mininterval=360.0):
         metrics = trainer.eval_step(batch)
         
@@ -707,7 +769,11 @@ def eval_epoch(
                 metrics_sum[k] += metrics[k]
         num_batches += 1
     
-    return {k: v / num_batches for k, v in metrics_sum.items()}
+    eval_time = time.perf_counter() - eval_start
+    avg_metrics = {k: v / num_batches for k, v in metrics_sum.items()} if num_batches > 0 else metrics_sum
+    avg_metrics['eval_time_s'] = eval_time
+    
+    return avg_metrics
 
 
 @torch.no_grad()
@@ -741,14 +807,16 @@ def run_phase2_evaluation(
     Returns:
         Dictionary with Phase 2 metrics
     """
-    print("\n" + "="*60)
-    print("[Phase 2] Running evaluation metrics...")
-    print("="*60)
+    logger.info("=" * 60)
+    logger.info("[Phase 2] Running evaluation metrics...")
+    logger.info("=" * 60)
     
     results = {}
+    phase2_start = time.perf_counter()
     
     # 1. Normalized Loss Recovered
-    print("\n[Phase 2] Computing Normalized Loss Recovered...")
+    logger.info("Computing Normalized Loss Recovered...")
+    nlr_start = time.perf_counter()
     try:
         nlr_results = compute_normalized_loss_recovered(
             model=orbis_model,
@@ -761,16 +829,19 @@ def run_phase2_evaluation(
             max_batches=max_batches,
         )
         results.update({f"phase2_{k}": v for k, v in nlr_results.items()})
-        print(f"  L_base: {nlr_results['L_base']:.6f}")
-        print(f"  L_sae:  {nlr_results['L_sae']:.6f}")
-        print(f"  L_zero: {nlr_results['L_zero']:.6f}")
-        print(f"  Normalized Loss Recovered: {nlr_results['normalized_loss_recovered']:.4f}")
+        nlr_time = time.perf_counter() - nlr_start
+        logger.info(f"  L_base: {nlr_results['L_base']:.6f}")
+        logger.info(f"  L_sae:  {nlr_results['L_sae']:.6f}")
+        logger.info(f"  L_zero: {nlr_results['L_zero']:.6f}")
+        logger.info(f"  Normalized Loss Recovered: {nlr_results['normalized_loss_recovered']:.4f}")
+        logger.info(f"  Time: {format_duration(nlr_time)}")
     except Exception as e:
-        print(f"  [WARNING] NLR computation failed: {e}")
+        logger.warning(f"NLR computation failed: {e}")
         results["phase2_nlr_error"] = str(e)
     
     # 2. Dictionary Coverage
-    print("\n[Phase 2] Computing Dictionary Coverage...")
+    logger.info("Computing Dictionary Coverage...")
+    coverage_start = time.perf_counter()
     try:
         coverage_results = compute_dictionary_coverage(
             sae=sae,
@@ -779,13 +850,18 @@ def run_phase2_evaluation(
             max_batches=max_batches * 2,  # Can process more batches for coverage
         )
         results.update({f"phase2_{k}": v for k, v in coverage_results.items()})
-        print(f"  Dictionary Coverage: {coverage_results['dictionary_coverage_pct']:.2f}%")
-        print(f"  Active Features: {coverage_results['num_active_features']} / {coverage_results['total_features']}")
+        coverage_time = time.perf_counter() - coverage_start
+        logger.info(f"  Dictionary Coverage: {coverage_results['dictionary_coverage_pct']:.2f}%")
+        logger.info(f"  Active Features: {coverage_results['num_active_features']} / {coverage_results['total_features']}")
+        logger.info(f"  Time: {format_duration(coverage_time)}")
     except Exception as e:
-        print(f"  [WARNING] Coverage computation failed: {e}")
+        logger.warning(f"Coverage computation failed: {e}")
         results["phase2_coverage_error"] = str(e)
     
-    print("="*60 + "\n")
+    phase2_time = time.perf_counter() - phase2_start
+    results["phase2_total_time_s"] = phase2_time
+    logger.info(f"Phase 2 total time: {format_duration(phase2_time)}")
+    logger.info("=" * 60)
     
     return results
 
@@ -798,7 +874,7 @@ def main(args: argparse.Namespace, unknown_args: Sequence[str] = ()):
         seed_everything(args.seed)
 
     device = torch.device(args.device)
-    print(f"[setup] Using device: {device}")
+    logger.info(f"Using device: {device}")
 
     # Setup paths
     exp_dir = Path(args.exp_dir)
@@ -831,21 +907,21 @@ def main(args: argparse.Namespace, unknown_args: Sequence[str] = ()):
         output_dir = runs_base / args.data_source / exp_dir.name / f"layer_{args.layer}" / barcode
     
     # Print barcode for SLURM script to capture
-    print(f"[barcode] {barcode}")
+    logger.info(f"[barcode] {barcode}")
     
     output_dir.mkdir(parents=True, exist_ok=True)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[setup] Experiment directory: {exp_dir}")
-    print(f"[setup] Cache directory: {cache_dir}")
-    print(f"[setup] Output directory: {output_dir}")
+    logger.info(f"Experiment directory: {exp_dir}")
+    logger.info(f"Cache directory: {cache_dir}")
+    logger.info(f"Output directory: {output_dir}")
 
     # Load Orbis model
     model = load_orbis_model(str(config_path), str(ckpt_path), device)
 
     # Get hidden dimension from model
     hidden_size = model.vit.blocks[0].norm1.normalized_shape[0]
-    print(f"[setup] ST-Transformer hidden size: {hidden_size}")
+    logger.info(f"ST-Transformer hidden size: {hidden_size}")
 
     # Cache directories
     train_cache_dir = cache_dir / "train"
@@ -861,7 +937,7 @@ def main(args: argparse.Namespace, unknown_args: Sequence[str] = ()):
     # 4. Cache only the remaining activations
     # ========================================================================
     
-    print(f"[data] Loading data from {args.data_source} source")
+    logger.info(f"Loading data from {args.data_source} source")
     
     if args.data_source in ("covla", "nuplan"):
         # === Step 1: Create datasets (not dataloaders) ===
@@ -890,7 +966,7 @@ def main(args: argparse.Namespace, unknown_args: Sequence[str] = ()):
             )
         
         # === Step 2: Check cache status for zero-cost resume ===
-        print(f"\n[cache] Checking train cache status...")
+        logger.info("Checking train cache status...")
         train_resume = get_cache_resume_info(
             cache_dir=train_cache_dir,
             batch_size=args.batch_size,
@@ -898,7 +974,7 @@ def main(args: argparse.Namespace, unknown_args: Sequence[str] = ()):
             rebuild=args.rebuild_cache,
         )
         
-        print(f"\n[cache] Checking validation cache status...")
+        logger.info("Checking validation cache status...")
         val_resume = get_cache_resume_info(
             cache_dir=val_cache_dir,
             batch_size=args.batch_size,
@@ -926,7 +1002,7 @@ def main(args: argparse.Namespace, unknown_args: Sequence[str] = ()):
         # === Step 4: Cache activations (zero-cost resume) ===
         # Skip caching if --train_only is set (assumes cache exists)
         if args.train_only:
-            print(f"\n[cache] --train_only: Skipping caching, assuming cache exists")
+            logger.info("--train_only: Skipping caching, assuming cache exists")
             train_cache_files = train_resume.valid_files
             val_cache_files = val_resume.valid_files
             if not train_resume.is_complete or not val_resume.is_complete:
@@ -940,7 +1016,7 @@ def main(args: argparse.Namespace, unknown_args: Sequence[str] = ()):
             
             try:
                 if not train_resume.is_complete:
-                    print(f"\n[cache] Caching train activations...")
+                    logger.info("Caching train activations...")
                     train_cache_files = prepare_activation_cache(
                         model=model,
                         dataloader=train_loader,
@@ -967,11 +1043,11 @@ def main(args: argparse.Namespace, unknown_args: Sequence[str] = ()):
                         stored_frame_rate=args.stored_frame_rate,
                     )
                 else:
-                    print(f"\n[cache] Train cache complete, skipping...")
+                    logger.info("Train cache complete, skipping...")
                     train_cache_files = train_resume.valid_files
                 
                 if not val_resume.is_complete:
-                    print(f"\n[cache] Caching validation activations...")
+                    logger.info("Caching validation activations...")
                     val_cache_files = prepare_activation_cache(
                         model=model,
                         dataloader=val_loader,
@@ -998,16 +1074,16 @@ def main(args: argparse.Namespace, unknown_args: Sequence[str] = ()):
                         stored_frame_rate=args.stored_frame_rate,
                     )
                 else:
-                    print(f"\n[cache] Validation cache complete, skipping...")
+                    logger.info("Validation cache complete, skipping...")
                     val_cache_files = val_resume.valid_files
                 
                 # Exit after caching if --cache_only is set
                 if args.cache_only:
-                    print(f"\n[cache] --cache_only: Caching complete, exiting")
+                    logger.info("--cache_only: Caching complete, exiting")
                     sys.exit(0)
                     
             except Exception as e:
-                print(f"\n[cache] FAILED: {e}")
+                logger.error(f"Caching FAILED: {e}")
                 sys.exit(1)  # Non-zero exit for SLURM afterok dependency
     
     else:
@@ -1048,7 +1124,7 @@ def main(args: argparse.Namespace, unknown_args: Sequence[str] = ()):
         
         # Skip caching if --train_only is set (assumes cache exists)
         if args.train_only:
-            print(f"\n[cache] --train_only: Skipping caching, assuming cache exists")
+            logger.info("--train_only: Skipping caching, assuming cache exists")
             train_cache_files = train_resume.valid_files
             val_cache_files = val_resume.valid_files
             if not train_resume.is_complete or not val_resume.is_complete:
@@ -1060,7 +1136,7 @@ def main(args: argparse.Namespace, unknown_args: Sequence[str] = ()):
             try:
                 # Cache activations (will skip batches via continue if resuming)
                 if not train_resume.is_complete:
-                    print(f"\n[cache] Caching train activations...")
+                    logger.info("Caching train activations...")
                     train_cache_files = prepare_activation_cache(
                         model=model,
                         dataloader=train_loader,
@@ -1087,7 +1163,7 @@ def main(args: argparse.Namespace, unknown_args: Sequence[str] = ()):
                     train_cache_files = train_resume.valid_files
                 
                 if not val_resume.is_complete:
-                    print(f"\n[cache] Caching validation activations...")
+                    logger.info("Caching validation activations...")
                     val_cache_files = prepare_activation_cache(
                         model=model,
                         dataloader=val_loader,
@@ -1115,17 +1191,17 @@ def main(args: argparse.Namespace, unknown_args: Sequence[str] = ()):
                 
                 # Exit after caching if --cache_only is set
                 if args.cache_only:
-                    print(f"\n[cache] --cache_only: Caching complete, exiting")
+                    logger.info("--cache_only: Caching complete, exiting")
                     sys.exit(0)
                     
             except Exception as e:
-                print(f"\n[cache] FAILED: {e}")
+                logger.error(f"Caching FAILED: {e}")
                 sys.exit(1)  # Non-zero exit for SLURM afterok dependency
 
     # Create activation dataloaders for SAE training
     # Use streaming mode for large datasets that don't fit in RAM
     in_memory = not args.streaming
-    print(f"\n[data] Creating activation dataloaders (streaming={args.streaming})...")
+    logger.info(f"Creating activation dataloaders (streaming={args.streaming})...")
     
     sae_batch_size = args.batch_size * args.sae_batch_multiplier
     train_act_loader, train_meta = create_activation_dataloader(
@@ -1146,9 +1222,9 @@ def main(args: argparse.Namespace, unknown_args: Sequence[str] = ()):
         max_tokens=args.max_tokens,  # Use same limit for val
     )
 
-    print(f"[data] SAE batch size: {sae_batch_size:,} ({args.batch_size} × {args.sae_batch_multiplier})")
-    print(f"[data] Train tokens: {train_meta['tokens_used']:,}")
-    print(f"[data] Val tokens: {val_meta['tokens_used']:,}")
+    logger.info(f"SAE batch size: {sae_batch_size:,} ({args.batch_size} × {args.sae_batch_multiplier})")
+    logger.info(f"Train tokens: {train_meta['tokens_used']:,}")
+    logger.info(f"Val tokens: {val_meta['tokens_used']:,}")
 
     # Create SAE
     sae_config = TopKSAEConfig(
@@ -1158,7 +1234,7 @@ def main(args: argparse.Namespace, unknown_args: Sequence[str] = ()):
     )
 
     sae = TopKSAE(sae_config)
-    print(f"\n[model] Created SAE: {sae}")
+    logger.info(f"Created SAE: {sae}")
 
     # Create trainer with optional optimizations
     trainer = TopKSAETrainer(
@@ -1169,9 +1245,9 @@ def main(args: argparse.Namespace, unknown_args: Sequence[str] = ()):
         compile_model=args.compile,
     )
     
-    print(f"[trainer] Accelerate fp16 mixed precision enabled")
+    logger.info("Accelerate fp16 mixed precision enabled")
     if args.compile:
-        print(f"[trainer] torch.compile enabled")
+        logger.info("torch.compile enabled")
 
     # Save comprehensive config for reproducibility
     # Get git commit hash if available
@@ -1257,39 +1333,65 @@ def main(args: argparse.Namespace, unknown_args: Sequence[str] = ()):
     with open(output_dir / "config.json", "w") as f:
         json.dump(config_save, f, indent=2)
     
-    print(f"[setup] Saved full config to {output_dir / 'config.json'}")
+    logger.info(f"Saved full config to {output_dir / 'config.json'}")
 
+    # Initialize timing stats
+    stats.set_run_info(run_name=barcode, layer=args.layer, data_source=args.data_source)
+    
+    # Determine data source type based on cache location
+    cache_path_str = str(cache_dir)
+    if "/tmp" in cache_path_str or "/scratch" in cache_path_str:
+        data_source_type = "tmpdir"
+    elif "/data/lmb" in cache_path_str:
+        data_source_type = "NVMe_SSD"
+    else:
+        data_source_type = "NFS"
+    stats.set_data_source(source_type=data_source_type, path=cache_path_str)
+    
+    # Start GPU monitoring
+    gpu_monitor = GPUMonitor(sample_interval_s=2.0, device_id=0 if torch.cuda.is_available() else -1)
+    if torch.cuda.is_available():
+        gpu_monitor.start()
+    
     # Training loop
-    print(f"\n[train] Starting training for {args.num_epochs} epochs...")
+    logger.info(f"Starting training for {args.num_epochs} epochs...")
+    training_start = time.perf_counter()
     best_val_loss = float("inf")
     history = []
 
     for epoch in range(1, args.num_epochs + 1):
-        # Train
-        train_metrics = train_epoch(trainer, train_act_loader, epoch, args.num_epochs)
+        # Train with IO wait tracking
+        train_metrics, epoch_stats = train_epoch(
+            trainer, train_act_loader, epoch, args.num_epochs, gpu_monitor
+        )
+        
+        # Record epoch stats for summary
+        stats.record_epoch(epoch_stats)
 
         # Evaluate
         if epoch % args.eval_every == 0 or epoch == args.num_epochs:
             val_metrics = eval_epoch(trainer, val_act_loader)
 
-            print(f"\nEpoch {epoch}/{args.num_epochs}:")
-            print(f"  Train - loss: {train_metrics['loss']:.4f}, l0: {train_metrics['l0']:.1f}, "
-                  f"R²: {train_metrics['explained_variance']:.4f}, cos_sim: {train_metrics['cos_sim']:.4f}")
-            print(f"          rel_err: {train_metrics['rel_error']:.4f}, L1: {train_metrics['l1_norm']:.2f}, "
-                  f"dead%: {train_metrics['dead_pct']:.1f}")
-            print(f"  Val   - loss: {val_metrics['loss']:.4f}, l0: {val_metrics['l0']:.1f}, "
-                  f"R²: {val_metrics['explained_variance']:.4f}, cos_sim: {val_metrics['cos_sim']:.4f}")
-            print(f"          rel_err: {val_metrics['rel_error']:.4f}, L1: {val_metrics['l1_norm']:.2f}")
+            logger.info(f"Epoch {epoch}/{args.num_epochs}:")
+            logger.info(f"  Train - loss: {train_metrics['loss']:.4f}, l0: {train_metrics['l0']:.1f}, "
+                        f"R²: {train_metrics['explained_variance']:.4f}, cos_sim: {train_metrics['cos_sim']:.4f}")
+            logger.info(f"          rel_err: {train_metrics['rel_error']:.4f}, L1: {train_metrics['l1_norm']:.2f}, "
+                        f"dead%: {train_metrics['dead_pct']:.1f}")
+            logger.info(f"          io_wait: {epoch_stats.io_wait_pct:.1f}%, efficiency: {epoch_stats.efficiency_index:.2f}")
+            logger.info(f"  Val   - loss: {val_metrics['loss']:.4f}, l0: {val_metrics['l0']:.1f}, "
+                        f"R²: {val_metrics['explained_variance']:.4f}, cos_sim: {val_metrics['cos_sim']:.4f}")
+            logger.info(f"          rel_err: {val_metrics['rel_error']:.4f}, L1: {val_metrics['l1_norm']:.2f}")
 
             # Save best model
             if val_metrics['loss'] < best_val_loss:
                 best_val_loss = val_metrics['loss']
                 sae.save(str(output_dir / "best_sae.pt"))
-                print(f"  -> New best model saved!")
+                logger.info("  -> New best model saved!")
         else:
             val_metrics = None
-            print(f"Epoch {epoch}/{args.num_epochs}: train_loss={train_metrics['loss']:.4f}, "
-                  f"l0={train_metrics['l0']:.1f}, dead%={train_metrics['dead_pct']:.1f}")
+            logger.info(f"Epoch {epoch}/{args.num_epochs}: train_loss={train_metrics['loss']:.4f}, "
+                        f"l0={train_metrics['l0']:.1f}, dead%={train_metrics['dead_pct']:.1f}, "
+                        f"io_wait%={epoch_stats.io_wait_pct:.1f}")
 
         # Phase 2 evaluation at specified epochs
         phase2_metrics = None
@@ -1325,9 +1427,38 @@ def main(args: argparse.Namespace, unknown_args: Sequence[str] = ()):
     with open(output_dir / "history.json", "w") as f:
         json.dump(history, f, indent=2)
 
-    print(f"\n[done] Training complete!")
-    print(f"  Best val loss: {best_val_loss:.4f}")
-    print(f"  Outputs saved to: {output_dir}")
+    # Stop GPU monitor and collect final stats
+    if torch.cuda.is_available():
+        gpu_monitor.stop()
+        stats.set_gpu_stats(gpu_monitor.get_stats())
+    
+    # Record training stats
+    training_time = time.perf_counter() - training_start
+    stats.set_training_stats(
+        num_epochs=args.num_epochs,
+        batches_per_epoch=len(train_act_loader),
+        final_loss=best_val_loss,
+    )
+    
+    # Record cache stats
+    stats.set_cache_stats(
+        train_batches=len(train_meta.get('files', [])) if isinstance(train_meta.get('files'), list) else train_meta.get('num_files', 0),
+        train_tokens=train_meta['tokens_used'],
+        train_bytes=train_meta.get('total_tokens', 0) * train_meta.get('hidden_dim', 0) * 2,  # Approximate
+        val_batches=len(val_meta.get('files', [])) if isinstance(val_meta.get('files'), list) else val_meta.get('num_files', 0),
+        val_tokens=val_meta['tokens_used'],
+        val_bytes=val_meta.get('total_tokens', 0) * val_meta.get('hidden_dim', 0) * 2,
+        dtype=args.cache_dtype,
+    )
+    
+    # Print summary and save timing stats
+    stats.print_summary()
+    stats.save_json(output_dir / "timing_stats.json")
+
+    logger.info("Training complete!")
+    logger.info(f"  Best val loss: {best_val_loss:.4f}")
+    logger.info(f"  Training time: {format_duration(training_time)}")
+    logger.info(f"  Outputs saved to: {output_dir}")
 
 
 def parse_args(argv=None):

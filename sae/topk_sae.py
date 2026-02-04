@@ -5,6 +5,7 @@ This implementation is adapted from SAEBench's TopKSAE but modified for training
 with MSE loss only (no sparsity penalty) and decoder weight normalization.
 """
 
+import time
 from dataclasses import dataclass
 from typing import Tuple
 
@@ -12,6 +13,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from accelerate import Accelerator
+
+from .logging_utils import get_logger
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -182,8 +187,11 @@ class TopKSAETrainer:
         
         # Optionally compile model for faster execution (default mode for Turing stability)
         if compile_model and hasattr(torch, 'compile'):
-            print("[trainer] Compiling model with torch.compile (default mode)...")
+            logger.info("Compiling model with torch.compile (default mode)...")
+            compile_start = time.perf_counter()
             self.model = torch.compile(self.model)
+            compile_time = time.perf_counter() - compile_start
+            logger.info(f"Model compilation completed in {compile_time:.2f}s")
         
         # Fused AdamW for reduced kernel launch overhead (supported on Turing)
         self.optimizer = torch.optim.AdamW(
