@@ -26,7 +26,7 @@ from .metrics import (
     compute_temporal_stability,
     run_full_evaluation,
 )
-from .logging_utils import (
+from .utils.logging_utils import (
     setup_sae_logging,
     get_logger,
     stats,

@@ -74,7 +74,7 @@ TRAIN_SCRIPT = ORBIS_ROOT / "sae" / "slurm" / "train.sh"
 CALIBRATE_BATCH_SIZE_SAE_SCRIPT = ORBIS_ROOT / "sae" / "slurm" / "calibrate_batch_size_sae.sh"
 
 # Default partition (used when none specified)
-DEFAULT_PARTITION = "lmbhiwidlc_gpu-rtx2080"
+DEFAULT_PARTITION = "tflmb_gpu-rtx4090"
 
 
 # =============================================================================
@@ -101,6 +101,18 @@ def confirm(message: str, default: bool = False) -> bool:
     except (EOFError, KeyboardInterrupt):
         logger.info("Aborted.")
         sys.exit(1)
+
+
+def is_webdataset_mode(data_source: str) -> bool:
+    """Check if data_source uses WebDataset format."""
+    return data_source.endswith("-webdataset")
+
+
+def get_base_data_source(data_source: str) -> str:
+    """Get base data source name (without -webdataset suffix)."""
+    if data_source.endswith("-webdataset"):
+        return data_source[:-len("-webdataset")]
+    return data_source
 
 
 def get_cache_dir(data_source: str, layer: int) -> Path:
@@ -157,7 +169,7 @@ def get_log_dir(log_type: str, data_source: str, layer: int) -> Path:
     if log_type == "sae_cache":
         return LOG_BASE / "sae_cache" / data_source / MODEL_NAME / f"layer_{layer}"
     else:  # runs
-        return LOG_BASE / data_source / MODEL_NAME / f"layer_{layer}" / "train"
+        return LOG_BASE / "runs" / data_source / MODEL_NAME / f"layer_{layer}" / "train"
 
 
 def submit_job(
@@ -343,8 +355,9 @@ def main():
     
     # Required arguments
     parser.add_argument("--data_source", type=str, required=True,
-                        choices=["nuplan", "covla"],
-                        help="Data source to use")
+                        choices=["nuplan", "nuplan-webdataset", "covla", "covla-webdataset"],
+                        help="Data source to use. Suffix '-webdataset' uses WebDataset shards "
+                             "(faster on NFS) instead of individual .pt files.")
     parser.add_argument("--layer", type=int, required=True,
                         help="Layer to extract activations from")
     
@@ -363,12 +376,19 @@ def main():
                         help="Seed for caching noise (default: 42)")
     
     # Training arguments
-    parser.add_argument("--epochs", type=int, default=50,
-                        help="Number of training epochs (default: 50)")
+    parser.add_argument("--epochs", type=int, default=1,
+                        help="Number of training epochs (default: 2)")
     parser.add_argument("--sae_batch_size", type=int, default=None,
-                        help="SAE batch size in tokens (default: from calibration or 4096)")
+                        help="SAE batch size in tokens (default: from calibration)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Training random seed (default: 42)")
+    
+    # WebDataset options (only used when data_source ends with "-webdataset")
+    parser.add_argument("--num_shards", type=int, default=None,
+                        help="Number of shards to use (for partial training, e.g., 59 for half)")
+    parser.add_argument("--shuffle_buffer", type=int, default=500000,
+                        help="Shuffle buffer size for WebDataset (default: 500000 tokens). "
+                             "Larger = better IID mixing. 500k uses ~1.5GB RAM.")
     
     # Orchestration control
     parser.add_argument("--rebuild_cache", action="store_true",
@@ -401,32 +421,58 @@ def main():
         logger.error(f"Train script not found: {TRAIN_SCRIPT}")
         sys.exit(1)
     
+    # Check if using WebDataset mode
+    use_webdataset = is_webdataset_mode(args.data_source)
+    base_data_source = get_base_data_source(args.data_source)
+    
     # Get cache directory and check status
     cache_dir = get_cache_dir(args.data_source, args.layer)
-    cache_complete = is_cache_complete(cache_dir)
-    cache_info = get_cache_info(cache_dir)
     
-    # Check if there's a partial cache (some files exist but not complete)
-    train_cache_exists = (cache_dir / "train").exists() and any((cache_dir / "train").glob("batch_*.pt"))
-    val_cache_exists = (cache_dir / "val").exists() and any((cache_dir / "val").glob("batch_*.pt"))
-    partial_cache_exists = (train_cache_exists or val_cache_exists) and not cache_complete
+    if use_webdataset:
+        # For WebDataset, check if shards exist (not _meta.json).
+        # Expected layout:
+        #   <cache_dir>/train/layer_<L>-train-000000.tar, ...
+        wds_train_dir = cache_dir / "train"
+        shard_files = list(wds_train_dir.glob("layer_*-train-*.tar"))
+        cache_complete = len(shard_files) > 0
+        cache_info = {"train": None, "val": None}
+        if cache_complete:
+            cache_info["train"] = {"num_files": len(shard_files), "total_tokens": "N/A (WebDataset)"}
+        partial_cache_exists = False  # WebDataset is all-or-nothing
+    else:
+        cache_complete = is_cache_complete(cache_dir)
+        cache_info = get_cache_info(cache_dir)
+        # Check if there's a partial cache (some files exist but not complete)
+        train_cache_exists = (cache_dir / "train").exists() and any((cache_dir / "train").glob("batch_*.pt"))
+        val_cache_exists = (cache_dir / "val").exists() and any((cache_dir / "val").glob("batch_*.pt"))
+        partial_cache_exists = (train_cache_exists or val_cache_exists) and not cache_complete
     
     logger.info("=== SAE Training Orchestrator ===")
     logger.info(f"Data source: {args.data_source}")
+    if use_webdataset:
+        logger.info(f"  Base source: {base_data_source}")
+        logger.info(f"  Format: WebDataset shards (optimized for NFS)")
+        if args.num_shards:
+            logger.info(f"  Shards to use: {args.num_shards}")
     logger.info(f"Layer: {args.layer}")
     logger.info(f"Cache directory: {cache_dir}")
-    logger.info(f"Cache status: {'COMPLETE' if cache_complete else 'INCOMPLETE'}")
+    if use_webdataset:
+        logger.info(f"WebDataset train directory: {wds_train_dir}")
+        logger.info(f"Shards status: {'FOUND' if cache_complete else 'NOT FOUND'} ({len(shard_files) if cache_complete else 0} shards)")
+    else:
+        logger.info(f"Cache status: {'COMPLETE' if cache_complete else 'INCOMPLETE'}")
     
-    # Show cache info if available
-    if cache_info["train"]:
-        logger.info(f"  Train: {cache_info['train']['num_files']} files, {cache_info['train']['total_tokens']:,} tokens")
-    if cache_info["val"]:
-        logger.info(f"  Val: {cache_info['val']['num_files']} files, {cache_info['val']['total_tokens']:,} tokens")
+    # Show cache info if available (skip for WebDataset since we already showed shard count)
+    if not use_webdataset:
+        if cache_info["train"]:
+            logger.info(f"  Train: {cache_info['train']['num_files']} files, {cache_info['train']['total_tokens']:,} tokens")
+        if cache_info["val"]:
+            logger.info(f"  Val: {cache_info['val']['num_files']} files, {cache_info['val']['total_tokens']:,} tokens")
     
     # === Confirmation prompts ===
     
-    # Confirm rebuild_cache (destructive operation)
-    if args.rebuild_cache and not args.dry_run:
+    # Confirm rebuild_cache (destructive operation) - not applicable for WebDataset
+    if args.rebuild_cache and not args.dry_run and not use_webdataset:
         if cache_complete or partial_cache_exists:
             logger.warning("--rebuild_cache will DELETE the existing cache!")
             if cache_info["train"]:
@@ -457,6 +503,15 @@ def main():
     need_train = not args.cache_only
     skip_cache = args.train_only
     
+    # In WebDataset mode, caching is handled by an offline conversion step.
+    # If shards are missing, fail fast with an actionable message.
+    if use_webdataset and not cache_complete and not args.dry_run:
+        logger.error("WebDataset shards not found for this layer.")
+        logger.error(f"  Expected train shards under: {cache_dir / 'train'}")
+        logger.error("Run the conversion first (or use non-WebDataset data_source):")
+        logger.error("  python sae/scripts/convert_to_webdataset.py")
+        sys.exit(1)
+    
     if skip_cache and not cache_complete:
         logger.error("--train_only specified but cache is incomplete")
         logger.error(f"  Train meta: {cache_dir / 'train' / '_meta.json'}")
@@ -467,13 +522,17 @@ def main():
     # Calibration Resource Check (Self-Discovery)
     # ==========================================================================
     calibrate_job_id = None
-    sae_batch_size_from_calibration = None
+    use_auto_batch_size = False  # Will train job read batch size from resource file?
     
-    # Default batch size if calibration is skipped/unavailable
-    DEFAULT_SAE_BATCH_SIZE = 4096
-    
-    if not args.skip_calibration and need_train:
-        # Step 1: Look up GPU slug for this partition
+    # If user explicitly provides --sae_batch_size, skip calibration entirely
+    if args.sae_batch_size is not None:
+        logger.info(f"User-specified SAE batch size: {args.sae_batch_size:,} tokens")
+        logger.info("Skipping calibration (explicit batch size provided)")
+    elif args.skip_calibration:
+        logger.info("Skipping calibration (--skip_calibration flag)")
+        logger.info("Train job will use default batch size (4096)")
+    elif need_train:
+        # Need to determine batch size via calibration
         gpu_slug = get_gpu_slug_for_partition(args.partition)
         
         if gpu_slug is None:
@@ -481,15 +540,14 @@ def main():
             logger.info(f"Partition '{args.partition}' not in partition_map.json")
             logger.info("Will submit calibration job to discover GPU and find optimal batch size...")
             
-            # Check if calibration script exists
             if not CALIBRATE_BATCH_SIZE_SAE_SCRIPT.exists():
                 logger.error(f"Calibration script not found: {CALIBRATE_BATCH_SIZE_SAE_SCRIPT}")
-                logger.error("Use --skip_calibration to proceed with manual --sae_batch_size")
+                logger.error("Use --sae_batch_size to specify batch size manually")
                 sys.exit(1)
             
             if not args.yes and not args.dry_run:
                 if not confirm("Submit calibration job first?", default=True):
-                    logger.info("Aborted. Use --skip_calibration to proceed without calibration.")
+                    logger.info("Aborted. Use --sae_batch_size to specify batch size manually.")
                     sys.exit(0)
             
             calibrate_job_id = submit_calibration_job(
@@ -501,10 +559,10 @@ def main():
             
             if calibrate_job_id:
                 logger.info(f"Calibration job submitted: {calibrate_job_id}")
-                logger.info("Note: Training job will use default sae_batch_size until calibration completes.")
-                logger.info("      Re-run this script after calibration to use the optimized batch size.")
+                logger.info("Train job will wait for calibration and read batch size from resource file")
+                use_auto_batch_size = True
         else:
-            # Step 2: Check if hardware-specific calibration exists
+            # Check if hardware-specific calibration exists
             logger.info(f"Partition '{args.partition}' maps to GPU: {gpu_slug}")
             resource_path = get_resource_path(args.layer, args.expansion, args.k, gpu_slug)
             calibration = load_calibration_resource(resource_path)
@@ -516,12 +574,12 @@ def main():
                 
                 if not CALIBRATE_BATCH_SIZE_SAE_SCRIPT.exists():
                     logger.error(f"Calibration script not found: {CALIBRATE_BATCH_SIZE_SAE_SCRIPT}")
-                    logger.error("Use --skip_calibration to proceed with manual --sae_batch_size")
+                    logger.error("Use --sae_batch_size to specify batch size manually")
                     sys.exit(1)
                 
                 if not args.yes and not args.dry_run:
                     if not confirm("Submit calibration job first?", default=True):
-                        logger.info("Aborted. Use --skip_calibration to proceed without calibration.")
+                        logger.info("Aborted. Use --sae_batch_size to specify batch size manually.")
                         sys.exit(0)
                 
                 calibrate_job_id = submit_calibration_job(
@@ -533,27 +591,27 @@ def main():
                 
                 if calibrate_job_id:
                     logger.info(f"Calibration job submitted: {calibrate_job_id}")
+                    logger.info("Train job will wait for calibration and read batch size from resource file")
+                    use_auto_batch_size = True
             else:
-                # Use calibrated batch size directly
-                sae_batch_size_from_calibration = calibration["recommended_batch_size_tokens"]
-                logger.info(f"Using calibrated batch size: {sae_batch_size_from_calibration:,} tokens")
-                logger.info(f"  (from GPU: {calibration.get('gpu', gpu_slug)})")
-    
-    # Determine effective SAE batch size
-    if args.sae_batch_size is not None:
-        effective_sae_batch_size = args.sae_batch_size
-        logger.info(f"Using user-specified SAE batch size: {effective_sae_batch_size:,}")
-    elif sae_batch_size_from_calibration is not None:
-        effective_sae_batch_size = sae_batch_size_from_calibration
-    else:
-        effective_sae_batch_size = DEFAULT_SAE_BATCH_SIZE
-        logger.info(f"Using default SAE batch size: {effective_sae_batch_size:,}")
+                # Calibration already exists - train job will read it at runtime
+                logger.info(f"Calibration resource found for GPU '{gpu_slug}'")
+                logger.info(f"  Recommended batch size: {calibration['recommended_batch_size_tokens']:,} tokens")
+                logger.info("Train job will read batch size from resource file at runtime")
+                use_auto_batch_size = True
     
     cache_job_id = None
     train_job_id = None
     
-    # Submit cache job if needed
-    if need_cache and not skip_cache:
+    # For WebDataset mode, we don't need to cache - shards should already exist
+    if use_webdataset and need_cache and not skip_cache:
+        logger.warning("WebDataset mode does not support caching - shards must already exist")
+        logger.warning("Skipping cache job submission")
+        need_cache = False
+        skip_cache = True  # Treat as if --train_only was specified
+    
+    # Submit cache job if needed (only for non-WebDataset mode)
+    if need_cache and not skip_cache and not use_webdataset:
         cache_id = generate_cache_id(args.cache_seed)
         cache_log_dir = get_log_dir("sae_cache", args.data_source, args.layer)
         cache_log_dir.mkdir(parents=True, exist_ok=True)
@@ -593,6 +651,14 @@ def main():
         train_log_dir = get_log_dir("runs", args.data_source, args.layer)
         train_log_dir.mkdir(parents=True, exist_ok=True)
         
+        # Determine batch size argument: explicit value or "auto"
+        if args.sae_batch_size is not None:
+            batch_size_arg = str(args.sae_batch_size)
+        elif use_auto_batch_size:
+            batch_size_arg = "auto"
+        else:
+            batch_size_arg = "4096"  # Default fallback
+        
         train_args = [
             "--data_source", args.data_source,
             "--layer", str(args.layer),
@@ -600,12 +666,18 @@ def main():
             "--expansion", str(args.expansion),
             "--epochs", str(args.epochs),
             "--batch_size", str(args.batch_size),
-            "--sae_batch_size", str(effective_sae_batch_size),
+            "--sae_batch_size", batch_size_arg,
             "--seed", str(args.seed),
             "--barcode", train_barcode,
         ]
         if args.num_videos:
             train_args.extend(["--num_videos", str(args.num_videos)])
+        
+        # WebDataset options (only when using WebDataset format)
+        if use_webdataset:
+            train_args.extend(["--shuffle_buffer", str(args.shuffle_buffer)])
+            if args.num_shards:
+                train_args.extend(["--num_shards", str(args.num_shards)])
         
         # Add --train_only if cache job was submitted or skip_cache is set
         if cache_job_id or skip_cache:
@@ -623,6 +695,7 @@ def main():
         logger.info(f"Submitting train job: {train_barcode}")
         if dependency:
             logger.info(f"  Dependency: {dependency}")
+        logger.info(f"  SAE batch size: {batch_size_arg}")
         
         train_job_id = submit_job(
             script_path=TRAIN_SCRIPT,
@@ -645,12 +718,12 @@ def main():
     if not calibrate_job_id and not cache_job_id and not train_job_id:
         logger.info("No jobs submitted (dry run or nothing to do)")
     
-    if sae_batch_size_from_calibration:
-        logger.info(f"SAE batch size (from calibration): {effective_sae_batch_size:,} tokens")
-    elif args.sae_batch_size:
-        logger.info(f"SAE batch size (user-specified): {effective_sae_batch_size:,} tokens")
+    if args.sae_batch_size is not None:
+        logger.info(f"SAE batch size: {args.sae_batch_size:,} tokens (user-specified)")
+    elif use_auto_batch_size:
+        logger.info("SAE batch size: auto (will read from calibration resource at runtime)")
     else:
-        logger.info(f"SAE batch size (default): {effective_sae_batch_size:,} tokens")
+        logger.info("SAE batch size: 4096 tokens (default)")
     
     logger.info("Monitor jobs with: squeue -u $USER")
     

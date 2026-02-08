@@ -14,7 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from accelerate import Accelerator
 
-from .logging_utils import get_logger
+from .utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 

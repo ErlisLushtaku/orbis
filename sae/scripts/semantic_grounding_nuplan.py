@@ -34,7 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from sae.topk_sae import TopKSAE, TopKSAEConfig
 from sae.activation_hooks import ActivationExtractor
-from sae.logging_utils import get_logger, setup_sae_logging
+from sae.utils.logging_utils import get_logger, setup_sae_logging
 from data.nuplan.nuplan_dataset import NuPlanOrbisMultiFrame
 from util import instantiate_from_config
 

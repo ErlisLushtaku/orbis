@@ -9,7 +9,7 @@ This module provides:
 - Statistics summary with JSON export
 
 Usage:
-    from sae.logging_utils import get_logger, stats, PhaseTimer, EpochStats
+    from sae.utils.logging_utils import get_logger, stats, PhaseTimer, EpochStats
 
     logger = get_logger(__name__)
     
@@ -24,6 +24,8 @@ Usage:
 
 import json
 import logging
+import math
+import os
 import sys
 import threading
 import time
@@ -32,6 +34,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
+import psutil
 import torch
 
 # =============================================================================
@@ -338,8 +341,9 @@ class EpochStats:
     num_samples: int = 0
     bytes_read: int = 0
     
-    # Metrics
+    # Metrics (NaN-safe: only finite losses are accumulated)
     loss_sum: float = 0.0
+    loss_count: int = 0
     
     # GPU stats (filled by GPUMonitor)
     gpu_util_samples: List[float] = field(default_factory=list)
@@ -360,7 +364,9 @@ class EpochStats:
         self.num_batches += 1
         self.num_samples += batch_size
         self.bytes_read += bytes_read
-        self.loss_sum += loss
+        if math.isfinite(loss):
+            self.loss_sum += loss
+            self.loss_count += 1
     
     @property
     def efficiency_index(self) -> float:
@@ -401,9 +407,9 @@ class EpochStats:
     
     @property
     def avg_loss(self) -> Optional[float]:
-        """Average loss for the epoch."""
-        if self.num_batches > 0:
-            return self.loss_sum / self.num_batches
+        """Average loss for the epoch (NaN batches excluded)."""
+        if self.loss_count > 0:
+            return self.loss_sum / self.loss_count
         return None
     
     def to_dict(self) -> Dict[str, Any]:
@@ -462,10 +468,17 @@ class GPUMonitor:
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
         
-        # Samples
+        # GPU samples
         self._util_samples: List[float] = []
         self._memory_samples: List[float] = []
         self._timestamps: List[float] = []
+        
+        # RAM samples
+        self._process = psutil.Process(os.getpid())
+        self._ram_rss_samples: List[float] = []        # Main process RSS in bytes
+        self._ram_job_samples: List[float] = []        # Main + children RSS in bytes
+        self._ram_system_samples: List[float] = []     # System used RAM in bytes
+        self._ram_system_total: float = psutil.virtual_memory().total  # Total system RAM
         
         # Phase tracking
         self._current_phase: Optional[str] = None
@@ -481,7 +494,10 @@ class GPUMonitor:
             self._use_pynvml = True
             self.logger.debug("Using pynvml for GPU monitoring")
         except Exception:
-            self.logger.debug("pynvml not available, using torch.cuda for GPU monitoring")
+            self.logger.warning(
+                "pynvml not available -- GPU utilization will report 0%%. "
+                "Install nvidia-ml-py for accurate monitoring."
+            )
     
     def start(self) -> None:
         """Start the monitoring thread."""
@@ -513,24 +529,51 @@ class GPUMonitor:
         with self._lock:
             self._current_phase = None
     
+    def _get_job_memory(self) -> tuple:
+        """Get memory for the main process and the full process tree (main + workers).
+        
+        Returns:
+            Tuple of (main_rss_bytes, job_total_rss_bytes).
+        """
+        try:
+            main_rss = self._process.memory_info().rss
+            job_rss = main_rss
+            for child in self._process.children(recursive=True):
+                try:
+                    job_rss += child.memory_info().rss
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            return main_rss, job_rss
+        except Exception:
+            return 0, 0
+    
     def _sample_loop(self) -> None:
-        """Background sampling loop."""
+        """Background sampling loop for GPU and RAM metrics."""
         while self._running:
             try:
                 util, memory = self._get_gpu_stats()
+                
+                # RAM metrics (main process + DataLoader workers + system)
+                main_rss, job_rss = self._get_job_memory()
+                sys_mem = psutil.virtual_memory()
+                sys_used = sys_mem.total - sys_mem.available
+                
                 timestamp = time.time()
                 
                 with self._lock:
                     self._util_samples.append(util)
                     self._memory_samples.append(memory)
                     self._timestamps.append(timestamp)
+                    self._ram_rss_samples.append(main_rss)
+                    self._ram_job_samples.append(job_rss)
+                    self._ram_system_samples.append(sys_used)
                     
                     if self._current_phase is not None:
                         self._phase_samples[self._current_phase]["util"].append(util)
                         self._phase_samples[self._current_phase]["memory"].append(memory)
                 
             except Exception as e:
-                self.logger.debug(f"GPU sampling error: {e}")
+                self.logger.debug(f"Sampling error: {e}")
             
             time.sleep(self.sample_interval_s)
     
@@ -550,12 +593,12 @@ class GPUMonitor:
             return 0.0, 0.0
     
     def get_stats(self) -> Dict[str, Any]:
-        """Get overall statistics."""
+        """Get overall statistics including GPU and RAM."""
         with self._lock:
             if not self._util_samples:
                 return {}
             
-            return {
+            stats: Dict[str, Any] = {
                 "avg_util_pct": sum(self._util_samples) / len(self._util_samples),
                 "max_util_pct": max(self._util_samples),
                 "min_util_pct": min(self._util_samples),
@@ -563,6 +606,15 @@ class GPUMonitor:
                 "avg_memory_gb": sum(self._memory_samples) / len(self._memory_samples) / 1e9,
                 "num_samples": len(self._util_samples),
             }
+            
+            # RAM statistics
+            if self._ram_job_samples:
+                stats["job_ram_peak_gb"] = max(self._ram_job_samples) / 1e9
+                stats["main_process_ram_peak_gb"] = max(self._ram_rss_samples) / 1e9
+                stats["system_ram_peak_gb"] = max(self._ram_system_samples) / 1e9
+                stats["system_ram_total_gb"] = self._ram_system_total / 1e9
+            
+            return stats
     
     def get_phase_stats(self, phase: str) -> Dict[str, Any]:
         """Get statistics for a specific phase."""
@@ -628,6 +680,9 @@ class TimingStats:
         
         # GPU statistics
         self.gpu_stats: Dict[str, Any] = {}
+        
+        # RAM statistics
+        self.ram_stats: Dict[str, Any] = {}
         
         # Start time for total duration
         self._start_time: Optional[float] = None
@@ -719,6 +774,10 @@ class TimingStats:
     def set_gpu_stats(self, gpu_stats: Dict[str, Any]) -> None:
         """Set GPU statistics from GPUMonitor."""
         self.gpu_stats = gpu_stats
+    
+    def set_ram_stats(self, ram_stats: Dict[str, Any]) -> None:
+        """Set RAM statistics from GPUMonitor."""
+        self.ram_stats = ram_stats
     
     def finalize(self) -> None:
         """Finalize statistics collection."""
@@ -838,6 +897,10 @@ class TimingStats:
         # GPU stats
         if self.gpu_stats:
             result["gpu_stats"] = self.gpu_stats
+        
+        # RAM stats
+        if self.ram_stats:
+            result["ram_stats"] = self.ram_stats
         
         # Total duration
         result["total_duration_s"] = round(self.total_duration_s, 3)
@@ -1001,6 +1064,17 @@ class TimingStats:
             lines.append(
                 f"Peak GPU Memory: {gpu.get('peak_memory_gb', 0):.1f} GB | "
                 f"Avg GPU Utilization: {gpu.get('avg_util_pct', 0):.0f}%"
+            )
+        
+        # RAM statistics
+        if self.ram_stats:
+            ram = self.ram_stats
+            sys_total = ram.get('system_ram_total_gb', 0)
+            sys_peak = ram.get('system_ram_peak_gb', 0)
+            sys_pct = (sys_peak / sys_total * 100) if sys_total > 0 else 0
+            lines.append(
+                f"Job RAM (peak): {ram.get('job_ram_peak_gb', 0):.1f} GB | "
+                f"System RAM: {sys_peak:.1f} / {sys_total:.1f} GB ({sys_pct:.1f}%)"
             )
         
         lines.append(sep)

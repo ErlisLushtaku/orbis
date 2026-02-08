@@ -45,7 +45,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from sae.topk_sae import TopKSAE, TopKSAEConfig
 from sae.activation_hooks import ActivationExtractor
 from sae.caching import prepare_activation_cache, load_activation_cache, resolve_cache_dtype
-from sae.logging_utils import get_logger, setup_sae_logging
+from sae.utils.logging_utils import get_logger, setup_sae_logging
 from data.covla.covla_dataset import CoVLAOrbisMultiFrame
 from util import instantiate_from_config
 

@@ -9,7 +9,8 @@
 #   sbatch sae/slurm/train.sh --data_source covla [OPTIONS]
 #
 # Required:
-#   --data_source STR  Data source: "nuplan" or "covla"
+#   --data_source STR  Data source: "nuplan", "nuplan-webdataset", "covla", or "covla-webdataset"
+#                      Use "-webdataset" suffix for WebDataset shards (faster on NFS)
 #
 # Options (override defaults):
 #   --layer N              Layer to extract activations from (default: 22 for nuplan, 12 for covla)
@@ -18,28 +19,31 @@
 #   --num_videos N         Number of videos to use (default: dataset-specific)
 #   --epochs N             Number of training epochs (default: 50)
 #   --batch_size N         Batch size for caching (default: 4)
-#   --sae_batch_size N     SAE batch size in tokens (default: 4096)
+#   --sae_batch_size N     SAE batch size in tokens (default: 4096, or "auto" to read from calibration)
 #   --seed N               Random seed (default: 42)
 #   --max_tokens N         Limit tokens used for training (default: all)
 #   --rebuild_cache        Force rebuild of activation cache
 #   --train_only           Skip caching, assume cache exists (used by orchestrator)
 #   --barcode NAME         Use specific barcode instead of auto-generating
 #   --no_streaming         Disable streaming mode (load all into RAM)
+#   --num_shards N         Number of shards to use for WebDataset (for partial training)
+#   --shuffle_buffer N     Shuffle buffer size for WebDataset (default: 500000)
 #
 # Examples:
 #   sbatch sae/slurm/train.sh --data_source nuplan --layer 22
+#   sbatch sae/slurm/train.sh --data_source nuplan-webdataset --layer 22 --num_shards 59
 #   sbatch sae/slurm/train.sh --data_source covla --layer 12 --k 64 --expansion 16
 #
-# Logs will be saved to: sae/slurm/logs/{dataset}/{model}/layer_{N}/train/{barcode}.{out,err}
+# Logs will be saved to: sae/slurm/logs/runs/{dataset}/{model}/layer_{N}/train/{barcode}.{out,err}
 #
 
 #SBATCH --job-name=sae_train
 #SBATCH --time=24:00:00
-#SBATCH --partition=lmbhiwidlc_gpu-rtx2080
+#SBATCH --partition=tflmb_gpu-rtx4090
 #SBATCH --account=lmbhiwi-dlc
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=32G
+#SBATCH --mem=150GB
 #SBATCH --output=/work/dlclarge2/lushtake-thesis/orbis/sae/slurm/logs/slurm_init_%j.out
 #SBATCH --error=/work/dlclarge2/lushtake-thesis/orbis/sae/slurm/logs/slurm_init_%j.err
 
@@ -54,10 +58,10 @@ DATA_SOURCE=""
 # Default training parameters (will be overridden based on data_source)
 LAYER=""
 BATCH_SIZE=4
-NUM_EPOCHS=50
+NUM_EPOCHS=1
 K=64
 EXPANSION_FACTOR=16
-SAE_BATCH_SIZE=4096
+SAE_BATCH_SIZE="4096"  # Can be "auto" to read from calibration resource
 SEED=42
 NUM_VIDEOS=""
 MAX_TOKENS=""
@@ -65,6 +69,8 @@ REBUILD_CACHE="false"
 STREAMING="true"
 TRAIN_ONLY="false"
 BARCODE=""
+NUM_SHARDS=""
+SHUFFLE_BUFFER=500000
 
 # ------------------------------
 # Parse Command Line Arguments
@@ -127,41 +133,58 @@ while [[ $# -gt 0 ]]; do
             BARCODE="$2"
             shift 2
             ;;
+        --num_shards)
+            NUM_SHARDS="$2"
+            shift 2
+            ;;
+        --shuffle_buffer)
+            SHUFFLE_BUFFER="$2"
+            shift 2
+            ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: sbatch train.sh --data_source {nuplan,covla} [--layer N] [--k N] [--expansion N] [--num_videos N] [--epochs N] [--batch_size N] [--sae_batch_size N] [--seed N] [--max_tokens N] [--rebuild_cache] [--no_streaming] [--train_only] [--barcode NAME]"
+            echo "Usage: sbatch train.sh --data_source {nuplan,covla} [OPTIONS]"
             exit 1
             ;;
     esac
 done
 
 # ------------------------------
-# Validate data_source
+# Validate data_source and detect WebDataset mode
 # ------------------------------
 if [ -z "$DATA_SOURCE" ]; then
     echo "ERROR: --data_source is required"
-    echo "Usage: sbatch train.sh --data_source {nuplan,covla} [OPTIONS]"
+    echo "Usage: sbatch train.sh --data_source {nuplan,nuplan-webdataset,covla,covla-webdataset} [OPTIONS]"
     exit 1
 fi
 
-if [ "$DATA_SOURCE" != "nuplan" ] && [ "$DATA_SOURCE" != "covla" ]; then
-    echo "ERROR: Invalid data_source '$DATA_SOURCE'. Must be 'nuplan' or 'covla'"
+# Detect WebDataset mode and extract base data source
+USE_WEBDATASET="false"
+BASE_DATA_SOURCE="$DATA_SOURCE"
+if [[ "$DATA_SOURCE" == *"-webdataset" ]]; then
+    USE_WEBDATASET="true"
+    BASE_DATA_SOURCE="${DATA_SOURCE%-webdataset}"
+fi
+
+# Validate base data source
+if [ "$BASE_DATA_SOURCE" != "nuplan" ] && [ "$BASE_DATA_SOURCE" != "covla" ]; then
+    echo "ERROR: Invalid data_source '$DATA_SOURCE'. Must be 'nuplan', 'nuplan-webdataset', 'covla', or 'covla-webdataset'"
     exit 1
 fi
 
 # ------------------------------
-# Set data source specific defaults
+# Set data source specific defaults (based on BASE_DATA_SOURCE)
 # ------------------------------
 ORBIS_ROOT="/work/dlclarge2/lushtake-thesis/orbis"
 EXP_DIR="${ORBIS_ROOT}/logs_wm/${MODEL_NAME}"
 
-if [ "$DATA_SOURCE" = "nuplan" ]; then
+if [ "$BASE_DATA_SOURCE" = "nuplan" ]; then
     DATA_DIR="/work/dlcsmall2/galessos-nuPlan/nuPlan_640x360_10Hz"
     STORED_FRAME_RATE=10
     [ -z "$LAYER" ] && LAYER=22
     [ -z "$NUM_VIDEOS" ] && NUM_VIDEOS=988
     DATA_ARG="--nuplan_data_dir"
-elif [ "$DATA_SOURCE" = "covla" ]; then
+elif [ "$BASE_DATA_SOURCE" = "covla" ]; then
     DATA_DIR="/work/dlclarge2/lushtake-thesis/data/covla/videos"
     CAPTIONS_DIR="/work/dlclarge2/lushtake-thesis/data/covla/captions"
     STORED_FRAME_RATE=20
@@ -181,7 +204,7 @@ fi
 # ------------------------------
 # Setup log directories
 # ------------------------------
-LOG_DIR="${ORBIS_ROOT}/sae/slurm/logs/${DATA_SOURCE}/${MODEL_NAME}/layer_${LAYER}/train"
+LOG_DIR="${ORBIS_ROOT}/sae/slurm/logs/runs/${DATA_SOURCE}/${MODEL_NAME}/layer_${LAYER}/train"
 mkdir -p "$LOG_DIR"
 
 # Redirect stdout and stderr to log files
@@ -224,10 +247,12 @@ echo ""
 
 echo "Training parameters:"
 echo "  data_source=$DATA_SOURCE"
+echo "  base_data_source=$BASE_DATA_SOURCE"
+echo "  webdataset_mode=$USE_WEBDATASET"
 echo "  model=$MODEL_NAME"
 echo "  layer=$LAYER"
 echo "  batch_size=$BATCH_SIZE"
-echo "  sae_batch_size=$SAE_BATCH_SIZE tokens"
+echo "  sae_batch_size=$SAE_BATCH_SIZE"
 echo "  num_epochs=$NUM_EPOCHS"
 echo "  k=$K"
 echo "  expansion_factor=$EXPANSION_FACTOR"
@@ -237,6 +262,10 @@ echo "  max_tokens=$MAX_TOKENS"
 echo "  rebuild_cache=$REBUILD_CACHE"
 echo "  streaming=$STREAMING"
 echo "  train_only=$TRAIN_ONLY"
+if [ "$USE_WEBDATASET" = "true" ]; then
+    echo "  num_shards=$NUM_SHARDS"
+    echo "  shuffle_buffer=$SHUFFLE_BUFFER"
+fi
 echo ""
 echo "Output paths:"
 echo "  Run dir: logs_sae/runs/${DATA_SOURCE}/${MODEL_NAME}/layer_${LAYER}/${BARCODE}/"
@@ -267,8 +296,8 @@ TRAIN_CMD="python sae/scripts/train_sae.py \
     --seed \"$SEED\" \
     --run_name \"$BARCODE\""
 
-# Add captions dir for covla
-if [ "$DATA_SOURCE" = "covla" ]; then
+# Add captions dir for covla (check base data source)
+if [ "$BASE_DATA_SOURCE" = "covla" ]; then
     TRAIN_CMD="$TRAIN_CMD --covla_captions_dir \"$CAPTIONS_DIR\""
 fi
 
@@ -292,6 +321,17 @@ fi
 if [ -n "$MAX_TOKENS" ]; then
     TRAIN_CMD="$TRAIN_CMD --max_tokens $MAX_TOKENS"
     echo "[INFO] Using max_tokens=$MAX_TOKENS (subset of cached data)"
+fi
+
+# Add WebDataset options if in WebDataset mode (detected from data_source suffix)
+if [ "$USE_WEBDATASET" = "true" ]; then
+    TRAIN_CMD="$TRAIN_CMD --shuffle_buffer $SHUFFLE_BUFFER"
+    echo "[INFO] WebDataset mode - using sharded tar archives for training"
+    
+    if [ -n "$NUM_SHARDS" ]; then
+        TRAIN_CMD="$TRAIN_CMD --num_shards $NUM_SHARDS"
+        echo "[INFO] Using num_shards=$NUM_SHARDS"
+    fi
 fi
 
 eval $TRAIN_CMD

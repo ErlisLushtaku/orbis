@@ -21,11 +21,13 @@ See orbis/sae/configs/default.yaml for all configuration options.
 
 import argparse
 import json
+import logging
+import math
 import os
 import sys
 import time
 from pathlib import Path
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Callable, Dict, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -51,13 +53,12 @@ from sae.caching import (
     get_cache_resume_info,
     prepare_activation_cache,
     create_activation_dataloader,
+    create_webdataset_dataloader,
     resolve_cache_dtype,
 )
-from sae.metrics import (
-    compute_normalized_loss_recovered,
-    compute_dictionary_coverage,
-)
-from sae.logging_utils import (
+# Phase 2 metrics (NLR, coverage) are available in sae.metrics for standalone
+# evaluation scripts but are not used inline during training. See docs/ToDo.md.
+from sae.utils.logging_utils import (
     setup_sae_logging,
     get_logger,
     stats,
@@ -79,6 +80,78 @@ from data.custom_multiframe import (
 from data.multiframe_val import MultiFrameFromPaths
 from data.covla.covla_dataset import CoVLAOrbisMultiFrame
 from data.nuplan.nuplan_dataset import NuPlanOrbisMultiFrame
+
+
+# =============================================================================
+# Helper Functions for Data Source and Batch Size Resolution
+# =============================================================================
+
+def is_webdataset_mode(data_source: str) -> bool:
+    """Check if data_source uses WebDataset format (ends with '-webdataset')."""
+    return data_source.endswith("-webdataset")
+
+
+def get_base_data_source(data_source: str) -> str:
+    """Get base data source name (without -webdataset suffix)."""
+    if data_source.endswith("-webdataset"):
+        return data_source[:-len("-webdataset")]
+    return data_source
+
+
+def resolve_sae_batch_size(
+    batch_size_arg: str,
+    layer: int,
+    expansion: int,
+    k: int,
+    default: int = 4096,
+) -> int:
+    """
+    Resolve SAE batch size from argument.
+    
+    Args:
+        batch_size_arg: "auto" or an integer string
+        layer: Transformer layer number
+        expansion: SAE expansion factor
+        k: Top-K sparsity value
+        default: Default batch size if "auto" cannot resolve
+        
+    Returns:
+        Resolved batch size as integer
+    """
+    if batch_size_arg.lower() == "auto":
+        # Try to read from calibration resource
+        try:
+            from sae.calibrate_batch_size import (
+                get_gpu_info,
+                get_sae_resource_path,
+                load_resource,
+            )
+            
+            gpu_info = get_gpu_info()
+            gpu_slug = gpu_info.slug
+            
+            resource_path = get_sae_resource_path(layer, expansion, k, gpu_slug)
+            calibration = load_resource(resource_path)
+            
+            if calibration is None:
+                logger.warning(f"No calibration resource found at {resource_path}, using default")
+                return default
+            
+            batch_size = calibration["recommended_batch_size_tokens"]
+            logger.info(f"Auto-detected batch size from calibration: {batch_size:,} tokens")
+            logger.info(f"  (GPU: {calibration.get('gpu', gpu_slug)})")
+            return batch_size
+            
+        except Exception as e:
+            logger.warning(f"Failed to auto-detect batch size: {e}, using default")
+            return default
+    else:
+        # Parse as integer
+        try:
+            return int(batch_size_arg)
+        except ValueError:
+            logger.error(f"Invalid sae_batch_size: {batch_size_arg}. Must be 'auto' or an integer.")
+            raise
 
 
 def load_orbis_model(
@@ -656,9 +729,24 @@ def train_epoch(
     epoch: int,
     total_epochs: int,
     gpu_monitor: Optional[GPUMonitor] = None,
+    steps_per_epoch: Optional[int] = None,
+    checkpoint_callback: Optional[Callable[[int, int], None]] = None,
+    checkpoint_steps: Optional[set] = None,
 ) -> Tuple[Dict[str, float], EpochStats]:
     """
     Train for one epoch with full Phase 1 metric logging and IO wait tracking.
+    
+    Args:
+        trainer: SAE trainer instance
+        dataloader: DataLoader or WebLoader for training data
+        epoch: Current epoch number
+        total_epochs: Total number of epochs
+        gpu_monitor: Optional GPU monitor for tracking utilization
+        steps_per_epoch: Number of steps per epoch (required for IterableDatasets
+                        like WebLoader that don't have __len__)
+        checkpoint_callback: Optional callback for intra-epoch checkpoints.
+            Called as callback(step, total_steps) at steps in checkpoint_steps.
+        checkpoint_steps: Set of step numbers at which to call checkpoint_callback.
     
     Returns:
         Tuple of (averaged metrics dict, EpochStats with IO timing)
@@ -677,6 +765,8 @@ def train_epoch(
         "l1_norm": 0.0,
         "dead_pct": 0.0,
     }
+    # Per-metric valid counts (some metrics can be NaN from fp16 edge cases)
+    valid_counts = {k: 0 for k in metrics_sum}
     num_batches = 0
     
     # Set GPU monitor phase
@@ -685,7 +775,20 @@ def train_epoch(
     
     # Create iterator for IO wait timing
     data_iter = iter(dataloader)
-    pbar = tqdm(range(len(dataloader)), desc=f"Epoch {epoch}/{total_epochs} [train]", 
+    
+    # Determine number of steps (use steps_per_epoch for IterableDatasets like WebLoader)
+    try:
+        num_steps = len(dataloader)
+    except TypeError:
+        # WebLoader and other IterableDatasets don't have __len__
+        if steps_per_epoch is None:
+            raise ValueError(
+                "steps_per_epoch is required for IterableDatasets (e.g., WebLoader) "
+                "that don't have __len__"
+            )
+        num_steps = steps_per_epoch
+    
+    pbar = tqdm(range(num_steps), desc=f"Epoch {epoch}/{total_epochs} [train]", 
                 file=sys.stdout, mininterval=360.0)
     
     for _ in pbar:
@@ -711,9 +814,11 @@ def train_epoch(
             loss=metrics.get('loss', 0.0),
         )
         
+        # NaN-safe accumulation: skip NaN/Inf values to prevent poisoning
         for k in metrics_sum.keys():
-            if k in metrics:
+            if k in metrics and math.isfinite(metrics[k]):
                 metrics_sum[k] += metrics[k]
+                valid_counts[k] += 1
         num_batches += 1
         
         # Display key metrics in progress bar: loss, l0, dead%, io_wait%
@@ -724,6 +829,10 @@ def train_epoch(
             "dead%": f"{metrics['dead_pct']:.1f}",
             "io%": f"{io_pct:.1f}",
         })
+        
+        # Intra-epoch checkpoint
+        if checkpoint_callback is not None and checkpoint_steps and num_batches in checkpoint_steps:
+            checkpoint_callback(num_batches, num_steps)
     
     # Collect GPU stats for this epoch
     if gpu_monitor is not None:
@@ -734,8 +843,11 @@ def train_epoch(
             epoch_stats.gpu_memory_samples.append(gpu_stats['peak_memory_gb'] * 1e9)
         gpu_monitor.clear_phase()
     
-    # Average metrics
-    avg_metrics = {k: v / num_batches for k, v in metrics_sum.items()} if num_batches > 0 else metrics_sum
+    # Average metrics using per-metric valid counts to handle NaN batches
+    avg_metrics = {
+        k: v / valid_counts[k] if valid_counts[k] > 0 else float('nan')
+        for k, v in metrics_sum.items()
+    }
     
     return avg_metrics, epoch_stats
 
@@ -758,6 +870,7 @@ def eval_epoch(
         "l1_norm": 0.0,
         "dead_pct": 0.0,
     }
+    valid_counts = {k: 0 for k in metrics_sum}
     num_batches = 0
     
     eval_start = time.perf_counter()
@@ -765,105 +878,19 @@ def eval_epoch(
         metrics = trainer.eval_step(batch)
         
         for k in metrics_sum.keys():
-            if k in metrics:
+            if k in metrics and math.isfinite(metrics[k]):
                 metrics_sum[k] += metrics[k]
+                valid_counts[k] += 1
         num_batches += 1
     
     eval_time = time.perf_counter() - eval_start
-    avg_metrics = {k: v / num_batches for k, v in metrics_sum.items()} if num_batches > 0 else metrics_sum
+    avg_metrics = {
+        k: v / valid_counts[k] if valid_counts[k] > 0 else float('nan')
+        for k, v in metrics_sum.items()
+    }
     avg_metrics['eval_time_s'] = eval_time
     
     return avg_metrics
-
-
-@torch.no_grad()
-def run_phase2_evaluation(
-    orbis_model: nn.Module,
-    sae: TopKSAE,
-    image_dataloader: DataLoader,
-    activation_dataloader: DataLoader,
-    layer_idx: int,
-    device: torch.device,
-    t_noise: float = 0.0,
-    frame_rate: int = 5,
-    max_batches: int = 50,
-) -> Dict[str, float]:
-    """
-    Run Phase 2 evaluation metrics: Normalized Loss Recovered and Dictionary Coverage.
-    
-    This is expensive as it requires running the full Orbis model.
-    
-    Args:
-        orbis_model: Pre-trained Orbis world model
-        sae: Trained SAE model
-        image_dataloader: DataLoader for images (for NLR)
-        activation_dataloader: DataLoader for cached activations (for coverage)
-        layer_idx: Layer to intervene on
-        device: Device to run on
-        t_noise: Noise timestep
-        frame_rate: Frame rate conditioning
-        max_batches: Max batches to limit compute
-        
-    Returns:
-        Dictionary with Phase 2 metrics
-    """
-    logger.info("=" * 60)
-    logger.info("[Phase 2] Running evaluation metrics...")
-    logger.info("=" * 60)
-    
-    results = {}
-    phase2_start = time.perf_counter()
-    
-    # 1. Normalized Loss Recovered
-    logger.info("Computing Normalized Loss Recovered...")
-    nlr_start = time.perf_counter()
-    try:
-        nlr_results = compute_normalized_loss_recovered(
-            model=orbis_model,
-            sae=sae,
-            dataloader=image_dataloader,
-            layer_idx=layer_idx,
-            device=device,
-            t_noise=t_noise,
-            frame_rate=frame_rate,
-            max_batches=max_batches,
-        )
-        results.update({f"phase2_{k}": v for k, v in nlr_results.items()})
-        nlr_time = time.perf_counter() - nlr_start
-        logger.info(f"  L_base: {nlr_results['L_base']:.6f}")
-        logger.info(f"  L_sae:  {nlr_results['L_sae']:.6f}")
-        logger.info(f"  L_zero: {nlr_results['L_zero']:.6f}")
-        logger.info(f"  Normalized Loss Recovered: {nlr_results['normalized_loss_recovered']:.4f}")
-        logger.info(f"  Time: {format_duration(nlr_time)}")
-    except Exception as e:
-        logger.warning(f"NLR computation failed: {e}")
-        results["phase2_nlr_error"] = str(e)
-    
-    # 2. Dictionary Coverage
-    logger.info("Computing Dictionary Coverage...")
-    coverage_start = time.perf_counter()
-    try:
-        coverage_results = compute_dictionary_coverage(
-            sae=sae,
-            dataloader=activation_dataloader,
-            device=device,
-            max_batches=max_batches * 2,  # Can process more batches for coverage
-        )
-        results.update({f"phase2_{k}": v for k, v in coverage_results.items()})
-        coverage_time = time.perf_counter() - coverage_start
-        logger.info(f"  Dictionary Coverage: {coverage_results['dictionary_coverage_pct']:.2f}%")
-        logger.info(f"  Active Features: {coverage_results['num_active_features']} / {coverage_results['total_features']}")
-        logger.info(f"  Time: {format_duration(coverage_time)}")
-    except Exception as e:
-        logger.warning(f"Coverage computation failed: {e}")
-        results["phase2_coverage_error"] = str(e)
-    
-    phase2_time = time.perf_counter() - phase2_start
-    results["phase2_total_time_s"] = phase2_time
-    logger.info(f"Phase 2 total time: {format_duration(phase2_time)}")
-    logger.info("=" * 60)
-    
-    return results
 
 
 def main(args: argparse.Namespace, unknown_args: Sequence[str] = ()):
@@ -916,12 +943,29 @@ def main(args: argparse.Namespace, unknown_args: Sequence[str] = ()):
     logger.info(f"Cache directory: {cache_dir}")
     logger.info(f"Output directory: {output_dir}")
 
-    # Load Orbis model
-    model = load_orbis_model(str(config_path), str(ckpt_path), device)
-
-    # Get hidden dimension from model
-    hidden_size = model.vit.blocks[0].norm1.normalized_shape[0]
-    logger.info(f"ST-Transformer hidden size: {hidden_size}")
+    # Get base data source (strip "-webdataset" suffix if present)
+    base_data_source = get_base_data_source(args.data_source)
+    use_webdataset = is_webdataset_mode(args.data_source)
+    
+    # Determine if we need to load the Orbis model
+    # Model is ONLY needed for extracting activations via prepare_activation_cache()
+    # Skip loading if:
+    #   - WebDataset mode: activations already in shards
+    #   - --train_only: user asserts cache exists, skip caching phase
+    skip_model_load = use_webdataset or args.train_only
+    
+    if skip_model_load:
+        # Activations are pre-cached, don't need the model
+        model = None
+        hidden_size = 768  # Standard hidden size for Orbis/ViT-Base
+        reason = "WebDataset mode" if use_webdataset else "--train_only flag"
+        logger.info(f"Skipping model load ({reason}) - using hidden_size={hidden_size}")
+    else:
+        # Need to potentially extract activations, load the model
+        model = load_orbis_model(str(config_path), str(ckpt_path), device)
+        # Get hidden dimension from model
+        hidden_size = model.vit.blocks[0].norm1.normalized_shape[0]
+        logger.info(f"ST-Transformer hidden size: {hidden_size}")
 
     # Cache directories
     train_cache_dir = cache_dir / "train"
@@ -938,10 +982,14 @@ def main(args: argparse.Namespace, unknown_args: Sequence[str] = ()):
     # ========================================================================
     
     logger.info(f"Loading data from {args.data_source} source")
+    if use_webdataset:
+        logger.info(f"  Base source: {base_data_source}")
+        logger.info(f"  Format: WebDataset shards (optimized for NFS)")
     
-    if args.data_source in ("covla", "nuplan"):
+    if base_data_source in ("covla", "nuplan") and not use_webdataset:
         # === Step 1: Create datasets (not dataloaders) ===
-        if args.data_source == "covla":
+        # Note: For WebDataset mode, we skip caching as shards already exist
+        if base_data_source == "covla":
             if args.covla_videos_dir is None:
                 raise ValueError("covla_videos_dir required for CoVLA data source")
             train_dataset, val_dataset = create_datasets_covla(
@@ -1012,7 +1060,7 @@ def main(args: argparse.Namespace, unknown_args: Sequence[str] = ()):
                 )
         else:
             # Determine data_dir for metadata
-            data_dir = args.covla_videos_dir if args.data_source == "covla" else args.nuplan_data_dir
+            data_dir = args.covla_videos_dir if base_data_source == "covla" else args.nuplan_data_dir
             
             try:
                 if not train_resume.is_complete:
@@ -1085,6 +1133,13 @@ def main(args: argparse.Namespace, unknown_args: Sequence[str] = ()):
             except Exception as e:
                 logger.error(f"Caching FAILED: {e}")
                 sys.exit(1)  # Non-zero exit for SLURM afterok dependency
+    
+    elif use_webdataset:
+        # === WEBDATASET FLOW: Skip caching, shards already exist ===
+        logger.info("WebDataset mode: Skipping caching (shards already exist)")
+        # train_cache_files and val_cache_files are not needed for WebDataset
+        # They will be replaced by WebDataset loaders below
+        pass
     
     else:
         # === LEGACY FLOW for other data sources (cityscapes, hdf5, image_paths) ===
@@ -1199,32 +1254,148 @@ def main(args: argparse.Namespace, unknown_args: Sequence[str] = ()):
                 sys.exit(1)  # Non-zero exit for SLURM afterok dependency
 
     # Create activation dataloaders for SAE training
-    # Use streaming mode for large datasets that don't fit in RAM
-    in_memory = not args.streaming
-    logger.info(f"Creating activation dataloaders (streaming={args.streaming})...")
+    # Resolve SAE batch size (handles "auto" by reading from calibration resource)
+    sae_batch_size = resolve_sae_batch_size(
+        batch_size_arg=args.sae_batch_size,
+        layer=args.layer,
+        expansion=args.expansion_factor,
+        k=args.k,
+    )
+    logger.info(f"SAE batch size: {sae_batch_size:,} tokens")
     
-    sae_batch_size = args.sae_batch_size
-    train_act_loader, train_meta = create_activation_dataloader(
-        train_cache_dir,
-        batch_size=sae_batch_size,
-        shuffle=True,
-        num_workers=4 if args.streaming else 0,  # Workers help with streaming, hurt with in-memory
-        in_memory=in_memory,
-        max_tokens=args.max_tokens,
-    )
+    if use_webdataset:
+        # === WebDataset mode: Stream from sharded tar archives ===
+        # This is much faster on NFS due to sequential I/O
+        logger.info("Creating WebDataset dataloaders (optimized for NFS)...")
+        
+        # Shards are expected under <cache_dir>/train.
+        wds_dir = train_cache_dir
+        
+        if not wds_dir.exists():
+            raise FileNotFoundError(
+                f"WebDataset directory not found: {wds_dir}\n"
+                f"Run the conversion script first: python sae/scripts/convert_to_webdataset.py"
+            )
+        
+        # Count available shards (train)
+        available_shards = sorted(wds_dir.glob(f"layer_{args.layer}-train-*.tar"))
+        total_shards = len(available_shards)
+        if total_shards == 0:
+            raise FileNotFoundError(f"No shards found in {wds_dir}")
+        
+        num_shards = args.num_shards or total_shards
+        if num_shards > total_shards:
+            logger.warning(f"Requested {num_shards} shards but only {total_shards} available. Using all.")
+            num_shards = total_shards
+        
+        # Use an explicit list of shards (robust to missing indices)
+        train_shards = [str(p) for p in available_shards[:num_shards]]
+        
+        logger.info(f"WebDataset train directory: {wds_dir}")
+        logger.info(f"Using {len(train_shards)} train shards")
+        logger.info(f"Using {num_shards}/{total_shards} shards")
+        # Cached batch size from conversion (tokens per .pt file)
+        # Each file contains 4 clips × 6 frames × 576 spatial = 13824 correlated tokens
+        CACHED_BATCH_SIZE = 13824
+        
+        # Use large shuffle buffer for proper IID mixing
+        # Memory: shuffle_buffer × 768 × 4 bytes (e.g., 500k ≈ 1.5GB)
+        logger.info(f"Shuffle buffer: {args.shuffle_buffer:,} tokens")
+        
+        train_act_loader, train_meta = create_webdataset_dataloader(
+            shard_pattern=train_shards,
+            batch_size=sae_batch_size,
+            shuffle_buffer=args.shuffle_buffer,
+            num_workers=4,
+            seed=args.seed,
+            cached_batch_size=CACHED_BATCH_SIZE,
+        )
+        
+        # Validation (WebDataset shards under <cache_dir>/val, or legacy .pt files)
+        val_act_loader = None
+        val_meta: Dict[str, Any] = {"tokens_used": 0, "total_tokens": 0}
+        
+        if val_cache_dir.exists():
+            val_shards = sorted(val_cache_dir.glob(f"layer_{args.layer}-val-*.tar"))
+            if len(val_shards) > 0:
+                logger.info(f"Using WebDataset shards for validation: {val_cache_dir} ({len(val_shards)} shards)")
+                val_act_loader, val_meta = create_webdataset_dataloader(
+                    shard_pattern=[str(p) for p in val_shards],
+                    batch_size=sae_batch_size,
+                    shuffle_buffer=0,  # no shuffle for validation
+                    num_workers=0,
+                    seed=args.seed,
+                    cached_batch_size=CACHED_BATCH_SIZE,
+                )
+                # Try to read val meta if present (optional)
+                meta_path = val_cache_dir / "_meta.json"
+                if meta_path.exists():
+                    try:
+                        with open(meta_path, "r") as f:
+                            meta_json = json.load(f)
+                        if isinstance(meta_json, dict) and "total_tokens" in meta_json:
+                            val_meta["tokens_used"] = int(meta_json["total_tokens"])
+                            val_meta["total_tokens"] = int(meta_json["total_tokens"])
+                    except Exception:
+                        # Best-effort only
+                        pass
+            elif list(val_cache_dir.glob("batch_*.pt")):
+                logger.info("Using individual .pt files for validation (cache exists)")
+                val_act_loader, val_meta = create_activation_dataloader(
+                    val_cache_dir,
+                    batch_size=sae_batch_size,
+                    shuffle=False,
+                    num_workers=0,
+                    in_memory=True,
+                    max_tokens=args.max_tokens,
+                )
+        
+        if val_act_loader is None:
+            logger.warning("No validation cache found. Validation will be limited.")
+        
+        # Populate hidden_dim for byte calculation in cache stats
+        val_meta["hidden_dim"] = hidden_size
+        
+        # Estimate tokens for WebDataset (approximate)
+        estimated_batches_per_shard = 471
+        estimated_tokens = num_shards * estimated_batches_per_shard * CACHED_BATCH_SIZE
+        train_meta["tokens_used"] = estimated_tokens
+        train_meta["total_tokens"] = estimated_tokens  # For config.json compatibility
+        train_meta["estimated"] = True
+        train_meta["hidden_dim"] = hidden_size
+        train_meta["num_files"] = len(train_shards)
+        
+    else:
+        # === Standard mode: Load from individual .pt files ===
+        in_memory = not args.streaming
+        logger.info(f"Creating activation dataloaders (streaming={args.streaming})...")
+        
+        train_act_loader, train_meta = create_activation_dataloader(
+            train_cache_dir,
+            batch_size=sae_batch_size,
+            shuffle=True,
+            num_workers=4 if args.streaming else 0,
+            in_memory=in_memory,
+            max_tokens=args.max_tokens,
+        )
 
-    val_act_loader, val_meta = create_activation_dataloader(
-        val_cache_dir,
-        batch_size=sae_batch_size,
-        shuffle=False,
-        num_workers=4 if args.streaming else 0,
-        in_memory=in_memory,
-        max_tokens=args.max_tokens,  # Use same limit for val
-    )
+        val_act_loader, val_meta = create_activation_dataloader(
+            val_cache_dir,
+            batch_size=sae_batch_size,
+            shuffle=False,
+            num_workers=4 if args.streaming else 0,
+            in_memory=in_memory,
+            max_tokens=args.max_tokens,
+        )
 
     logger.info(f"SAE batch size: {sae_batch_size:,} tokens")
-    logger.info(f"Train tokens: {train_meta['tokens_used']:,}")
+    logger.info(f"Train tokens: {train_meta['tokens_used']:,}" + (" (estimated)" if train_meta.get("estimated") else ""))
     logger.info(f"Val tokens: {val_meta['tokens_used']:,}")
+
+    # Calculate steps per epoch (needed for WebDataset which doesn't have __len__)
+    # For standard dataloaders, len(dataloader) works; for WebLoader we need this
+    steps_per_epoch = train_meta['tokens_used'] // sae_batch_size
+    logger.info(f"Steps per epoch: {steps_per_epoch:,}")
 
     # Create SAE
     sae_config = TopKSAEConfig(
@@ -1359,10 +1530,57 @@ def main(args: argparse.Namespace, unknown_args: Sequence[str] = ()):
     best_val_loss = float("inf")
     history = []
 
+    # Automatic intra-epoch checkpointing when epochs are few and long
+    intra_ckpt_steps: Optional[set] = None
+    intra_ckpt_callback: Optional[Callable[[int, int], None]] = None
+    if args.num_epochs < 3 and steps_per_epoch > 0:
+        num_fractions = 4  # Checkpoint every 25%
+        intra_ckpt_steps = {
+            int(steps_per_epoch * (i + 1) / num_fractions)
+            for i in range(num_fractions - 1)  # Exclude 100% (handled by epoch end)
+        }
+        logger.info(
+            f"Intra-epoch checkpointing enabled (num_epochs={args.num_epochs} < 3): "
+            f"checkpoints at steps {sorted(intra_ckpt_steps)} / {steps_per_epoch}"
+        )
+
+        def _make_checkpoint_callback(
+            _sae: TopKSAE,
+            _trainer: TopKSAETrainer,
+            _val_loader: Optional[DataLoader],
+            _output_dir: Path,
+            _logger: logging.Logger,
+        ) -> Callable[[int, int], None]:
+            """Create checkpoint callback with proper closure over mutable best_val_loss."""
+            def callback(step: int, total_steps: int) -> None:
+                nonlocal best_val_loss
+                pct = step / total_steps * 100
+                _logger.info(f"  Intra-epoch checkpoint at step {step}/{total_steps} ({pct:.0f}%)")
+                _sae.save(str(_output_dir / f"sae_step_{step:06d}.pt"))
+
+                if _val_loader is not None:
+                    val_metrics = eval_epoch(_trainer, _val_loader)
+                    _logger.info(
+                        f"    val_loss={val_metrics['loss']:.4f}, "
+                        f"R2={val_metrics['explained_variance']:.4f}"
+                    )
+                    if val_metrics['loss'] < best_val_loss:
+                        best_val_loss = val_metrics['loss']
+                        _sae.save(str(_output_dir / "best_sae.pt"))
+                        _logger.info(f"    -> New best model (val_loss={best_val_loss:.4f})!")
+            return callback
+
+        intra_ckpt_callback = _make_checkpoint_callback(
+            sae, trainer, val_act_loader, output_dir, logger,
+        )
+
     for epoch in range(1, args.num_epochs + 1):
         # Train with IO wait tracking
         train_metrics, epoch_stats = train_epoch(
-            trainer, train_act_loader, epoch, args.num_epochs, gpu_monitor
+            trainer, train_act_loader, epoch, args.num_epochs, gpu_monitor,
+            steps_per_epoch=steps_per_epoch if use_webdataset else None,
+            checkpoint_callback=intra_ckpt_callback,
+            checkpoint_steps=intra_ckpt_steps,
         )
         
         # Record epoch stats for summary
@@ -1370,7 +1588,11 @@ def main(args: argparse.Namespace, unknown_args: Sequence[str] = ()):
 
         # Evaluate
         if epoch % args.eval_every == 0 or epoch == args.num_epochs:
-            val_metrics = eval_epoch(trainer, val_act_loader)
+            # Run validation if we have a validation loader
+            if val_act_loader is not None:
+                val_metrics = eval_epoch(trainer, val_act_loader)
+            else:
+                val_metrics = None
 
             logger.info(f"Epoch {epoch}/{args.num_epochs}:")
             logger.info(f"  Train - loss: {train_metrics['loss']:.4f}, l0: {train_metrics['l0']:.1f}, "
@@ -1378,13 +1600,16 @@ def main(args: argparse.Namespace, unknown_args: Sequence[str] = ()):
             logger.info(f"          rel_err: {train_metrics['rel_error']:.4f}, L1: {train_metrics['l1_norm']:.2f}, "
                         f"dead%: {train_metrics['dead_pct']:.1f}")
             logger.info(f"          io_wait: {epoch_stats.io_wait_pct:.1f}%, efficiency: {epoch_stats.efficiency_index:.2f}")
-            logger.info(f"  Val   - loss: {val_metrics['loss']:.4f}, l0: {val_metrics['l0']:.1f}, "
-                        f"R²: {val_metrics['explained_variance']:.4f}, cos_sim: {val_metrics['cos_sim']:.4f}")
-            logger.info(f"          rel_err: {val_metrics['rel_error']:.4f}, L1: {val_metrics['l1_norm']:.2f}")
+            
+            if val_metrics is not None:
+                logger.info(f"  Val   - loss: {val_metrics['loss']:.4f}, l0: {val_metrics['l0']:.1f}, "
+                            f"R²: {val_metrics['explained_variance']:.4f}, cos_sim: {val_metrics['cos_sim']:.4f}")
+                logger.info(f"          rel_err: {val_metrics['rel_error']:.4f}, L1: {val_metrics['l1_norm']:.2f}")
 
-            # Save best model
-            if val_metrics['loss'] < best_val_loss:
-                best_val_loss = val_metrics['loss']
+            # Save best model (use train loss if no validation)
+            compare_loss = val_metrics['loss'] if val_metrics else train_metrics['loss']
+            if compare_loss < best_val_loss:
+                best_val_loss = compare_loss
                 sae.save(str(output_dir / "best_sae.pt"))
                 logger.info("  -> New best model saved!")
         else:
@@ -1393,28 +1618,11 @@ def main(args: argparse.Namespace, unknown_args: Sequence[str] = ()):
                         f"l0={train_metrics['l0']:.1f}, dead%={train_metrics['dead_pct']:.1f}, "
                         f"io_wait%={epoch_stats.io_wait_pct:.1f}")
 
-        # Phase 2 evaluation at specified epochs
-        phase2_metrics = None
-        phase2_epochs = args.phase2_eval_epochs or [args.num_epochs]  # Default: only final epoch
-        if epoch in phase2_epochs:
-            phase2_metrics = run_phase2_evaluation(
-                orbis_model=model,
-                sae=sae,
-                image_dataloader=val_loader,  # Use image dataloader for NLR
-                activation_dataloader=val_act_loader,  # Use activation dataloader for coverage
-                layer_idx=args.layer,
-                device=device,
-                t_noise=args.t_noise,
-                frame_rate=args.frame_rate,
-                max_batches=args.phase2_max_batches,
-            )
-
         # Record history
         history.append({
             "epoch": epoch,
             "train": train_metrics,
             "val": val_metrics,
-            "phase2": phase2_metrics,
         })
 
         # Save checkpoint periodically
@@ -1427,16 +1635,20 @@ def main(args: argparse.Namespace, unknown_args: Sequence[str] = ()):
     with open(output_dir / "history.json", "w") as f:
         json.dump(history, f, indent=2)
 
-    # Stop GPU monitor and collect final stats
+    # Stop GPU monitor and collect final stats (includes RAM)
     if torch.cuda.is_available():
         gpu_monitor.stop()
-        stats.set_gpu_stats(gpu_monitor.get_stats())
+        monitor_stats = gpu_monitor.get_stats()
+        stats.set_gpu_stats(monitor_stats)
+        # Extract RAM stats from the combined monitor output
+        ram_keys = ("job_ram_peak_gb", "main_process_ram_peak_gb", "system_ram_peak_gb", "system_ram_total_gb")
+        stats.set_ram_stats({k: monitor_stats[k] for k in ram_keys if k in monitor_stats})
     
     # Record training stats
     training_time = time.perf_counter() - training_start
     stats.set_training_stats(
         num_epochs=args.num_epochs,
-        batches_per_epoch=len(train_act_loader),
+        batches_per_epoch=steps_per_epoch,
         final_loss=best_val_loss,
     )
     
@@ -1476,8 +1688,9 @@ def parse_args(argv=None):
         "--data_source",
         type=str,
         default="hdf5",
-        choices=["cityscapes", "hdf5", "image_paths", "covla", "nuplan"],
-        help="Data source: 'hdf5' (native Orbis data), 'cityscapes', 'image_paths', 'covla', or 'nuplan'",
+        choices=["cityscapes", "hdf5", "image_paths", "covla", "nuplan", "covla-webdataset", "nuplan-webdataset"],
+        help="Data source: 'hdf5' (native Orbis data), 'cityscapes', 'image_paths', 'covla', or 'nuplan'. "
+             "Use '-webdataset' suffix (e.g., 'nuplan-webdataset') for WebDataset shards (faster on NFS).",
     )
 
     # Cityscapes options (used when data_source=cityscapes)
@@ -1598,6 +1811,14 @@ def parse_args(argv=None):
                         help="Skip caching, assume cache exists. Used by orchestrator for separate train jobs.")
     parser.add_argument("--cache_seed", type=int, default=42,
                         help="Random seed for caching noise generation (for reproducibility)")
+    
+    # WebDataset options (used when data_source ends with '-webdataset')
+    parser.add_argument("--num_shards", type=int, default=None,
+                        help="Number of shards to use for WebDataset (for partial training). "
+                             "Example: --num_shards 59 for half the dataset.")
+    parser.add_argument("--shuffle_buffer", type=int, default=500000,
+                        help="Shuffle buffer size for WebDataset (default: 500000 tokens). "
+                             "Larger = better IID mixing but more memory. 500k uses ~1.5GB.")
 
     # Training
     parser.add_argument("--num_epochs", type=int, default=50,
@@ -1606,19 +1827,14 @@ def parse_args(argv=None):
                         help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=0.0,
                         help="Weight decay")
-    parser.add_argument("--sae_batch_size", type=int, default=4096,
-                        help="SAE batch size in tokens (default: 4096)")
+    parser.add_argument("--sae_batch_size", type=str, default="4096",
+                        help="SAE batch size in tokens (default: 4096). "
+                             "Use 'auto' to read from calibration resource file.")
     parser.add_argument("--eval_every", type=int, default=5,
                         help="Evaluate every N epochs")
     parser.add_argument("--save_every", type=int, default=10,
                         help="Save checkpoint every N epochs")
     
-    # Phase 2 evaluation (expensive - requires Orbis model inference)
-    parser.add_argument("--phase2_eval_epochs", type=int, nargs="*", default=None,
-                        help="Epochs at which to run Phase 2 evaluation (NLR, coverage). "
-                             "Example: --phase2_eval_epochs 10 25 50. Default: only final epoch")
-    parser.add_argument("--phase2_max_batches", type=int, default=50,
-                        help="Max batches for Phase 2 evaluation (to limit compute)")
 
     # Output
     parser.add_argument("--output_dir", type=str, default=None,

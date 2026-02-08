@@ -7,15 +7,17 @@ activations to avoid repeated forward passes through the frozen Orbis model.
 Supports:
 - Stop/Resume: If caching is interrupted, it will resume from the last completed batch
 - Dataset Extension: If you increase num_videos, it will cache only the new batches
+- WebDataset: Efficient streaming from sharded tar archives for NFS performance
 """
 
+import io
 import json
 import os
 import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -24,7 +26,7 @@ from tqdm import tqdm
 from einops import rearrange
 
 from .activation_hooks import ActivationExtractor
-from .logging_utils import get_logger, format_duration, format_bytes, format_throughput
+from .utils.logging_utils import get_logger, format_duration, format_bytes, format_throughput
 
 logger = get_logger(__name__)
 
@@ -723,3 +725,156 @@ def create_activation_dataloader(
     )
     
     return dataloader, meta
+
+
+# =============================================================================
+# WebDataset Loader (for sharded tar archives)
+# =============================================================================
+
+
+def _pt_decoder(data: bytes) -> torch.Tensor:
+    """
+    Custom decoder for .pt files containing {"activations": tensor}.
+    
+    WebDataset only has built-in support for .pth files (via torch_loads),
+    so we need this custom decoder for .pt extension.
+    
+    Note: wds.handle_extension("pt", _pt_decoder) already filters for .pt files,
+    so this function receives only data bytes (not key).
+    
+    Args:
+        data: Raw bytes from the tar file
+        
+    Returns:
+        The activations tensor
+    """
+    stream = io.BytesIO(data)
+    loaded = torch.load(stream, weights_only=True, map_location="cpu")
+    
+    # Extract activations from {"activations": tensor} format
+    if isinstance(loaded, dict) and "activations" in loaded:
+        return loaded["activations"]
+    return loaded
+
+
+def create_webdataset_dataloader(
+    shard_pattern: Any,
+    batch_size: int,
+    shuffle_buffer: int = 500000,
+    num_workers: int = 4,
+    seed: int = 42,
+    pin_memory: bool = True,
+    cached_batch_size: int = 13824,
+) -> Tuple[Any, Dict[str, Any]]:
+    """
+    Create a WebDataset-based dataloader with shard and buffer shuffling.
+    
+    This provides efficient streaming from sharded tar archives on NFS, avoiding
+    the high latency of random file access.
+    
+    IMPORTANT - Data Correlation Warning:
+    The cached .pt files contain PRE-BATCHED activations from SEQUENTIAL video
+    frames (4 clips × 6 frames × 576 spatial tokens = 13824 tokens per file).
+    All tokens in one file are from the SAME video segment and highly correlated.
+    
+    To achieve proper IID mixing, we unbatch to individual tokens, shuffle with
+    a large buffer, then rebatch. The shuffle_buffer should be large enough to
+    mix tokens from many different videos.
+    
+    Memory usage: shuffle_buffer × 768 dims × 4 bytes
+    - 1M buffer   ≈ 3 GB
+    - 10M buffer  ≈ 30 GB  
+    - 50M buffer  ≈ 150 GB (excellent IID mixing)
+    
+    Args:
+        shard_pattern: Shard pattern or explicit list of shard paths, e.g.,
+            "/path/to/layer_22-train-*.tar" or [".../layer_22-train-000000.tar", ...]
+        batch_size: Desired batch size in tokens for training
+        shuffle_buffer: Size of in-memory shuffle buffer (default: 500000)
+            With 150GB RAM, can use up to ~50M for nearly full-dataset mixing.
+            Set to 0 to disable shuffling (useful for validation).
+        num_workers: Number of DataLoader workers (default: 4)
+        seed: Random seed for shard and buffer shuffling (default: 42)
+        pin_memory: Whether to pin memory for faster GPU transfer (default: True)
+        cached_batch_size: Size of pre-batched tensors in .pt files (default: 13824)
+        
+    Returns:
+        Tuple of (WebLoader dataloader, metadata dict)
+        
+    Example:
+        >>> loader, meta = create_webdataset_dataloader(
+        ...     shard_pattern="/data/layer_22-train-{000000..000057}.tar",
+        ...     batch_size=4096,
+        ...     shuffle_buffer=50_000_000,  # 50M tokens, ~150GB
+        ... )
+    """
+    try:
+        import webdataset as wds
+    except ImportError as e:
+        raise ImportError(
+            "WebDataset is required for sharded data loading. "
+            "Install with: pip install webdataset"
+        ) from e
+    
+    # Calculate effective mixing
+    files_in_buffer = (shuffle_buffer / cached_batch_size) if shuffle_buffer > 0 else 0.0
+    memory_gb = (shuffle_buffer * 768 * 4 / 1e9) if shuffle_buffer > 0 else 0.0
+    
+    if isinstance(shard_pattern, (list, tuple)):
+        shard_desc = f"{len(shard_pattern)} shards (explicit list)"
+        if len(shard_pattern) > 0:
+            shard_desc += f", first={shard_pattern[0]}, last={shard_pattern[-1]}"
+    else:
+        shard_desc = str(shard_pattern)
+    logger.info(f"Creating WebDataset loader from: {shard_desc}")
+    logger.info(f"Cached batch size: {cached_batch_size}, requested batch size: {batch_size}")
+    if shuffle_buffer > 0:
+        logger.info(f"Shuffle buffer: {shuffle_buffer:,} tokens (~{files_in_buffer:.1f} files mixed)")
+        logger.info(f"Memory estimate: ~{memory_gb:.2f} GB for shuffle buffer")
+    else:
+        logger.info("Shuffle disabled (shuffle_buffer=0)")
+    
+    if 0 < shuffle_buffer < cached_batch_size * 10:
+        logger.warning(
+            f"shuffle_buffer={shuffle_buffer} is small relative to cached_batch_size={cached_batch_size}. "
+            f"This means tokens from only ~{files_in_buffer:.1f} files are mixed at a time. "
+            f"Consider using shuffle_buffer >= {cached_batch_size * 36} (~500k) for better IID mixing."
+        )
+    
+    # Pipeline: unbatch → shuffle → rebatch
+    # We unbatch because cached files contain sequential correlated tokens
+    shardshuffle = 100 if shuffle_buffer > 0 else 0
+    dataset = wds.WebDataset(
+        shard_pattern,
+        shardshuffle=shardshuffle,
+        seed=seed,
+        empty_check=False,  # Allow fewer shards than workers
+    ).decode(wds.handle_extension("pt", _pt_decoder)).to_tuple("pt").unbatched()
+    
+    if shuffle_buffer > 0:
+        dataset = dataset.shuffle(shuffle_buffer)
+    
+    dataset = dataset.batched(batch_size, partial=True).map(lambda batch: batch[0].contiguous())
+    
+    # Use wds.WebLoader for proper IterableDataset handling
+    loader = wds.WebLoader(
+        dataset,
+        num_workers=num_workers,
+        batch_size=None,  # Batching done in pipeline
+        pin_memory=pin_memory,
+    )
+    
+    meta = {
+        "source": "webdataset",
+        "shard_pattern": shard_pattern,
+        "batch_size": batch_size,
+        "cached_batch_size": cached_batch_size,
+        "shuffle_buffer": shuffle_buffer,
+        "shuffle_buffer_gb": memory_gb,
+        "files_in_buffer": files_in_buffer,
+        "num_workers": num_workers,
+        "seed": seed,
+        "shardshuffle": shardshuffle,
+    }
+    
+    return loader, meta

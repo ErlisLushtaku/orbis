@@ -311,7 +311,7 @@ def _parse_args() -> argparse.Namespace:
 def main() -> int:
     """CLI entry point for SAE batch size calibration."""
     from sae.calibrate_batch_size.runner import run_calibration
-    from sae.logging_utils import get_logger, setup_sae_logging
+    from sae.utils.logging_utils import get_logger, setup_sae_logging
     
     args = _parse_args()
     setup_sae_logging(level="INFO")

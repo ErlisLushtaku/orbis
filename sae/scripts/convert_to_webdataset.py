@@ -22,8 +22,8 @@ from webdataset import ShardWriter
 # =============================================================================
 # Configuration
 # =============================================================================
-SRC_DIR = "/work/dlclarge2/lushtake-thesis/orbis/logs_sae/sae_cache/nuplan/orbis_288x512/layer_22/train"
-DST_PATTERN = "/data/lmbraid19/lushtake/sae_wds/layer_22-train-%06d.tar"
+SRC_DIR = "/work/dlclarge2/lushtake-thesis/orbis/logs_sae/sae_cache/nuplan/orbis_288x512/layer_22/val"
+DST_PATTERN = "/data/lmbraid19/lushtake/sae_wds/layer_22-val-%06d.tar"
 FILE_PATTERN = "batch_*.pt"
 SHARD_MAX_SIZE = 10e9  # 10 GB per shard
 PROGRESS_INTERVAL = 100  # Print progress every N files

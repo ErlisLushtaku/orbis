@@ -8,6 +8,7 @@ Implements:
 """
 
 import time
+from itertools import islice
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 
@@ -21,7 +22,7 @@ import matplotlib.pyplot as plt
 
 from .activation_hooks import ActivationIntervenor, ActivationExtractor, ZeroAblationIntervenor
 from .topk_sae import TopKSAE
-from .logging_utils import get_logger, format_duration
+from .utils.logging_utils import get_logger, format_duration
 
 logger = get_logger(__name__)
 
@@ -69,8 +70,7 @@ def compute_loss_recovered(
     baseline_errors = []
     sae_errors = []
     
-    iterator = tqdm(dataloader, desc="Computing Loss Recovered") if max_batches is None else \
-               tqdm(list(dataloader)[:max_batches], desc="Computing Loss Recovered")
+    iterator = tqdm(islice(dataloader, max_batches), total=max_batches, desc="Computing Loss Recovered")
     
     for batch in iterator:
         # Handle batch format
@@ -192,8 +192,7 @@ def compute_normalized_loss_recovered(
     sae_errors = []
     zero_errors = []
     
-    iterator = tqdm(dataloader, desc="Computing Normalized Loss Recovered") if max_batches is None else \
-               tqdm(list(dataloader)[:max_batches], desc="Computing Normalized Loss Recovered")
+    iterator = tqdm(islice(dataloader, max_batches), total=max_batches, desc="Computing Normalized Loss Recovered")
     
     for batch in iterator:
         # Handle batch format
@@ -307,8 +306,7 @@ def compute_dead_features(
     d_sae = sae.d_sae
     feature_ever_active = torch.zeros(d_sae, dtype=torch.bool, device=device)
     
-    iterator = tqdm(dataloader, desc="Checking dead features") if max_batches is None else \
-               tqdm(list(dataloader)[:max_batches], desc="Checking dead features")
+    iterator = tqdm(islice(dataloader, max_batches), total=max_batches, desc="Checking dead features")
     
     for batch in iterator:
         batch = batch.to(device)
@@ -366,8 +364,7 @@ def compute_dictionary_coverage(
     feature_ever_active = torch.zeros(d_sae, dtype=torch.bool, device=device)
     total_samples = 0
     
-    iterator = tqdm(dataloader, desc="Computing dictionary coverage") if max_batches is None else \
-               tqdm(list(dataloader)[:max_batches], desc="Computing dictionary coverage")
+    iterator = tqdm(islice(dataloader, max_batches), total=max_batches, desc="Computing dictionary coverage")
     
     for batch in iterator:
         batch = batch.to(device)
@@ -419,8 +416,7 @@ def compute_activation_density(
     feature_activation_counts = torch.zeros(d_sae, dtype=torch.long, device=device)
     total_samples = 0
     
-    iterator = tqdm(dataloader, desc="Computing activation density") if max_batches is None else \
-               tqdm(list(dataloader)[:max_batches], desc="Computing activation density")
+    iterator = tqdm(islice(dataloader, max_batches), total=max_batches, desc="Computing activation density")
     
     for batch in iterator:
         batch = batch.to(device)
@@ -504,8 +500,7 @@ def compute_temporal_stability(
     # We'll collect all per-feature autocorrelations and average at the end
     all_feature_autocorrs = []
     
-    iterator = tqdm(temporal_dataloader, desc="Computing temporal stability") if max_batches is None else \
-               tqdm(list(temporal_dataloader)[:max_batches], desc="Computing temporal stability")
+    iterator = tqdm(islice(temporal_dataloader, max_batches), total=max_batches, desc="Computing temporal stability")
     
     for batch in iterator:
         batch = batch.to(device)

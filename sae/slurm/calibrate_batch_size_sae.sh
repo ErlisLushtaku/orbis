@@ -34,7 +34,7 @@
 
 #SBATCH --job-name=sae_calibrate
 #SBATCH --time=01:00:00
-#SBATCH --partition=lmbhiwidlc_gpu-rtx2080
+#SBATCH --partition=tflmb_gpu-rtx4090
 #SBATCH --account=lmbhiwi-dlc
 #SBATCH --gres=gpu:1
 #SBATCH --mem=32G

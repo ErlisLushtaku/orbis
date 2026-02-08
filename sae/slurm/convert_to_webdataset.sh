@@ -28,7 +28,7 @@ echo "Date: $(date)"
 echo "=========================================="
 
 # Create output directory
-OUTPUT_DIR="/data/lmbraid19/lushtake/sae_wds"
+OUTPUT_DIR="/data/lmbraid19/lushtake/sae_wds/val"
 mkdir -p "${OUTPUT_DIR}"
 echo "Output directory: ${OUTPUT_DIR}"
 
