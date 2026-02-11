@@ -171,7 +171,7 @@ class ActivationIntervenor:
         # Pass through SAE (encode -> decode)
         self.sae.eval()
         with torch.no_grad():
-            reconstructed, _ = self.sae(flat_acts.to(self.sae.W_enc.device))
+            reconstructed, _, _, _, _ = self.sae(flat_acts.to(self.sae.W_enc.device))
             reconstructed = reconstructed.to(device=device, dtype=dtype)
         
         # Reshape back

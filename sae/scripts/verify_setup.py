@@ -97,7 +97,7 @@ def test_forward_backward():
         x = torch.randn(32, 768)  # (batch, d_in)
         
         # Forward pass
-        reconstruction, sparse_acts = sae(x)
+        reconstruction, sparse_acts, _, _, _ = sae(x)
         
         assert reconstruction.shape == x.shape, "Reconstruction shape mismatch"
         assert sparse_acts.shape == (32, 768 * 16), "Sparse acts shape mismatch"
@@ -155,7 +155,7 @@ def test_decoder_normalization():
         assert torch.all(bad_norms > 1.5), "Weights didn't change!"
         
         # 3. Restoration Test
-        sae.normalize_decoder_weights()
+        sae.set_decoder_norm_to_unit_norm()
         
         new_norms = torch.norm(sae.W_dec, dim=1)
         max_diff_after = torch.max(torch.abs(new_norms - target)).item()
@@ -163,7 +163,7 @@ def test_decoder_normalization():
         print(f"       [Post-Norm] Max deviation from Unit Norm: {max_diff_after:.9f}")
         
         assert torch.allclose(new_norms, target, atol=1e-5), \
-            f"Decoder weights not normalized after normalize_decoder_weights(). Max diff: {max_diff_after}"
+            f"Decoder weights not normalized after set_decoder_norm_to_unit_norm(). Max diff: {max_diff_after}"
         print(f"  [OK] Normalization function works correctly")
         
         return True
@@ -186,7 +186,7 @@ def test_save_load():
         
         # Random input for reference
         x = torch.randn(8, 768)
-        out1, _ = sae(x)
+        out1, _, _, _, _ = sae(x)
         
         # Save
         with tempfile.NamedTemporaryFile(suffix='.pt', delete=False) as f:

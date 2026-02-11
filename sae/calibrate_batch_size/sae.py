@@ -66,33 +66,30 @@ def sae_causes_oom(
     optimizer = None
     
     try:
-        # Create fresh model and optimizer for this test
+        # Create fresh model and optimizer for this test (fp32, matching real training)
         model = TopKSAE(sae_config).cuda()
-        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, fused=True)
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
         
         # Run multiple full training cycles to stress memory
         for _ in range(warmup_steps):
-            # Generate random batch (simulates activation data)
+            # Generate random batch (simulates activation data, fp32)
             batch = torch.randn(
                 batch_size, sae_config.d_in,
-                device="cuda", dtype=torch.float16
+                device="cuda", dtype=torch.float32
             )
             
             optimizer.zero_grad()
             
-            # Forward pass
-            with torch.autocast("cuda", dtype=torch.float16):
-                reconstruction, sparse_acts = model(batch)
-                loss = F.mse_loss(reconstruction, batch)
+            # Forward pass (fp32, matching real training)
+            model.set_decoder_norm_to_unit_norm()
+            reconstruction, sparse_acts, loss, _, _ = model(batch)
             
             # Backward pass (allocates gradient buffers)
             loss.backward()
             
             # Optimizer step (allocates optimizer state: momentum, variance)
+            model.remove_gradient_parallel_to_decoder_directions()
             optimizer.step()
-            
-            # Normalize decoder weights (as in real training)
-            model.normalize_decoder_weights()
             
             # Clean up iteration tensors
             del batch, reconstruction, sparse_acts, loss

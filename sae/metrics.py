@@ -281,7 +281,7 @@ def compute_dead_features(
     for batch in iterator:
         batch = batch.to(device)
         
-        sparse_acts = sae.encode(batch)
+        sparse_acts = sae.get_feature_activations(batch)
         batch_active = (sparse_acts > threshold).any(dim=0)
         feature_ever_active = feature_ever_active | batch_active
     
@@ -337,7 +337,7 @@ def compute_dictionary_coverage(
         batch = batch.to(device)
         batch_size = batch.shape[0]
         
-        sparse_acts = sae.encode(batch)
+        sparse_acts = sae.get_feature_activations(batch)
         batch_active = (sparse_acts > 0).any(dim=0)
         feature_ever_active = feature_ever_active | batch_active
         total_samples += batch_size
@@ -386,7 +386,7 @@ def compute_activation_density(
         batch = batch.to(device)
         batch_size = batch.shape[0]
         
-        sparse_acts = sae.encode(batch)
+        sparse_acts = sae.get_feature_activations(batch)
         activations = (sparse_acts > 0).sum(dim=0)
         feature_activation_counts += activations
         total_samples += batch_size
@@ -464,7 +464,7 @@ def compute_temporal_stability(
         batch = batch.to(device)
         batch_size = batch.shape[0]
         
-        sparse_acts = sae.encode(batch)
+        sparse_acts = sae.get_feature_activations(batch)
 
         if num_spatial_tokens is None:
             # Assume batch is flattened (B * F * N, d_in) where B=clips, F=frames, N=spatial

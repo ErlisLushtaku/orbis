@@ -1,19 +1,27 @@
 """
-Trainable Top-K Sparse Autoencoder for Orbis world model activations.
+Top-K Sparse Autoencoder for Orbis world model activations.
 
-This implementation is adapted from SAEBench's TopKSAE but modified for training
-with MSE loss only (no sparsity penalty) and decoder weight normalization.
+Training recipe combines ViT-Prisma's infrastructure (normalized MSE, gradient
+orthogonalization, geometric median init, cosine warmup scheduler, fp32) with
+the auxiliary TopK loss from SAELens/OpenAI (Gao et al., "Scaling and Evaluating
+Sparse Autoencoders") for dead-feature revival.
+
+Ghost gradients (ViT-Prisma style) are ineffective for TopK SAEs because dead
+features must compete in a hard top-k selection against well-optimized alive
+features. The auxiliary loss sidesteps this by giving dead features their own
+separate top-k selection over the residual.
 """
 
 import time
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from accelerate import Accelerator
 
+from .geometric_median import compute_geometric_median
+from .lr_scheduler import get_scheduler
 from .utils.constants import EPSILON
 from .utils.logging import get_logger
 
@@ -24,11 +32,18 @@ logger = get_logger(__name__)
 class TopKSAEConfig:
     """Configuration for TopK SAE."""
 
-    d_in: int  # Input dimension (hidden_size of ST-Transformer, e.g., 768)
-    expansion_factor: int = 16  # SAE width = d_in * expansion_factor
-    k: int = 64  # Number of active features (top-k)
+    d_in: int
+    expansion_factor: int = 16
+    k: int = 64
 
-    # Derived
+    dead_feature_window: int = 5000
+    aux_loss_coefficient: float = 1.0
+    normalize_activations: str = "none"  # "none" or "layer_norm"
+    b_dec_init_method: str = "geometric_median"  # "geometric_median", "mean", "zeros"
+
+    # Kept for checkpoint backward compatibility; not used in training
+    use_ghost_grads: bool = False
+
     @property
     def d_sae(self) -> int:
         return self.d_in * self.expansion_factor
@@ -39,11 +54,12 @@ class TopKSAE(nn.Module):
     Top-K Sparse Autoencoder.
 
     Architecture:
-        - Encoder: Linear(d_in -> d_sae) + ReLU + Top-K selection
-        - Decoder: Linear(d_sae -> d_in) with unit-norm columns
+        Encoder: Linear(d_in -> d_sae) + ReLU + Top-K selection
+        Decoder: Linear(d_sae -> d_in) with unit-norm rows
 
-    Training uses MSE reconstruction loss only (no L1 sparsity penalty).
-    Decoder weights are normalized after each optimizer step.
+    Loss: normalized MSE + auxiliary TopK loss for dead features.
+    Decoder rows are kept at unit norm before each forward pass; gradients
+    parallel to decoder directions are removed after backward.
     """
 
     def __init__(self, config: TopKSAEConfig):
@@ -61,68 +77,202 @@ class TopKSAE(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        """Initialize weights using Kaiming uniform for encoder, orthogonal for decoder."""
         nn.init.kaiming_uniform_(self.W_enc, a=0, mode="fan_in", nonlinearity="relu")
         nn.init.normal_(self.W_dec, mean=0, std=1.0 / self.d_in**0.5)
-        self.normalize_decoder_weights()
+        self.set_decoder_norm_to_unit_norm()
+
+    # ------------------------------------------------------------------
+    # Decoder norm management
+    # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def normalize_decoder_weights(self):
-        """Normalize decoder weight columns to unit norm."""
-        norms = torch.norm(self.W_dec, dim=1, keepdim=True)
-        self.W_dec.data = self.W_dec.data / (norms + EPSILON)
+    def set_decoder_norm_to_unit_norm(self):
+        """Normalize each decoder row to unit L2 norm."""
+        self.W_dec.data /= torch.norm(self.W_dec.data, dim=1, keepdim=True)
 
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
+    @torch.no_grad()
+    def remove_gradient_parallel_to_decoder_directions(self):
+        """Project out the gradient component parallel to W_dec rows."""
+        if self.W_dec.grad is None:
+            return
+        parallel_component = (self.W_dec.grad * self.W_dec.data).sum(dim=1, keepdim=True)
+        self.W_dec.grad -= parallel_component * self.W_dec.data
+
+    # ------------------------------------------------------------------
+    # b_dec initialization
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def initialize_b_dec(self, all_activations: torch.Tensor):
+        """Initialize b_dec from a batch of training activations."""
+        if self.config.b_dec_init_method == "geometric_median":
+            self._initialize_b_dec_geometric_median(all_activations)
+        elif self.config.b_dec_init_method == "mean":
+            self._initialize_b_dec_mean(all_activations)
+        elif self.config.b_dec_init_method == "zeros":
+            pass
+        else:
+            raise ValueError(f"Unknown b_dec_init_method: {self.config.b_dec_init_method}")
+
+    @torch.no_grad()
+    def _initialize_b_dec_geometric_median(self, all_activations: torch.Tensor):
+        previous_b_dec = self.b_dec.clone().cpu()
+
+        result = compute_geometric_median(all_activations.cpu(), maxiter=100)
+        median = result.median
+
+        previous_distances = torch.norm(all_activations.cpu() - previous_b_dec, dim=-1)
+        new_distances = torch.norm(all_activations.cpu() - median, dim=-1)
+
+        logger.info("Initializing b_dec with geometric median of activations")
+        logger.info(f"  Previous median distance: {previous_distances.median().item():.4f}")
+        logger.info(f"  New median distance:      {new_distances.median().item():.4f}")
+        logger.info(f"  Termination: {result.termination}")
+
+        self.b_dec.data = median.to(dtype=self.b_dec.dtype, device=self.b_dec.device)
+
+    @torch.no_grad()
+    def _initialize_b_dec_mean(self, all_activations: torch.Tensor):
+        previous_b_dec = self.b_dec.clone().cpu()
+        mean = all_activations.mean(dim=0).cpu()
+
+        previous_distances = torch.norm(all_activations.cpu() - previous_b_dec, dim=-1)
+        new_distances = torch.norm(all_activations.cpu() - mean, dim=-1)
+
+        logger.info("Initializing b_dec with mean of activations")
+        logger.info(f"  Previous median distance: {previous_distances.median().item():.4f}")
+        logger.info(f"  New median distance:      {new_distances.median().item():.4f}")
+
+        self.b_dec.data = mean.to(dtype=self.b_dec.dtype, device=self.b_dec.device)
+
+    # ------------------------------------------------------------------
+    # Loss functions
+    # ------------------------------------------------------------------
+
+    def _compute_mse_loss(self, x: torch.Tensor, sae_out: torch.Tensor) -> torch.Tensor:
+        """Normalized MSE: MSE divided by the norm of the centered input."""
+        x_centred = x - x.mean(dim=0, keepdim=True)
+        mse = F.mse_loss(sae_out, x.detach(), reduction="none")
+        norm_factor = torch.norm(x_centred, p=2, dim=-1, keepdim=True)
+        return (mse / (norm_factor + EPSILON)).mean()
+
+    def _compute_aux_topk_loss(
+        self,
+        x: torch.Tensor,
+        sae_out: torch.Tensor,
+        hidden_pre: torch.Tensor,
+        dead_neuron_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Auxiliary TopK loss for dead-feature revival.
+
+        From Gao et al. "Scaling and Evaluating Sparse Autoencoders" (Appendix B.1).
+        Instead of ghost gradients, dead features get their own top-k selection
+        over the residual. This is much more effective for TopK SAEs because
+        dead features don't compete with alive features.
+
+        Mechanism:
+            1. Compute residual = x - sae_out (what alive features missed)
+            2. Among dead features only, select top k_aux by pre-activation
+            3. Decode through dead features and compute MSE against residual
         """
-        Encode input activations to sparse feature activations.
+        num_dead = int(dead_neuron_mask.sum())
+        if num_dead == 0:
+            return torch.tensor(0.0, device=x.device)
+
+        residual = (x - sae_out).detach()
+
+        # k_aux = d_in // 2 (heuristic from Appendix B.1)
+        k_aux = self.d_in // 2
+        # Scale down when few features are dead
+        scale = min(num_dead / k_aux, 1.0)
+        k_aux = min(k_aux, num_dead)
+
+        # Select top-k_aux among dead features only (alive set to -inf)
+        auxk_latents = torch.where(dead_neuron_mask[None], hidden_pre, torch.tensor(-torch.inf, device=x.device))
+        auxk_topk = auxk_latents.topk(k_aux, sorted=False)
+
+        auxk_acts = torch.zeros_like(hidden_pre)
+        auxk_acts.scatter_(-1, auxk_topk.indices, auxk_topk.values)
+
+        # Decode through all features (only dead ones are non-zero)
+        recons = self.decode(auxk_acts)
+        auxk_loss = (recons - residual).pow(2).sum(dim=-1).mean()
+
+        return self.config.aux_loss_coefficient * scale * auxk_loss
+
+    # ------------------------------------------------------------------
+    # Forward pass
+    # ------------------------------------------------------------------
+
+    def encode(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Encode input activations to sparse feature activations.
 
         Args:
-            x: Input tensor of shape (..., d_in)
+            x: Input tensor of shape (..., d_in).
 
         Returns:
-            Sparse feature activations of shape (..., d_sae) with at most k non-zero entries
+            Tuple of (sparse_acts, hidden_pre) where hidden_pre is the
+            pre-activation (needed for auxiliary loss).
         """
+        if self.config.normalize_activations == "layer_norm":
+            x = F.layer_norm(x, (self.d_in,))
+
         x_centered = x - self.b_dec
-        pre_acts = F.relu(x_centered @ self.W_enc + self.b_enc)
-        topk_values, topk_indices = pre_acts.topk(self.k, dim=-1, sorted=False)
-        sparse_acts = torch.zeros_like(pre_acts)
+        hidden_pre = x_centered @ self.W_enc + self.b_enc
+        post_relu = F.relu(hidden_pre)
+        topk_values, topk_indices = post_relu.topk(self.k, dim=-1, sorted=False)
+
+        sparse_acts = torch.zeros_like(hidden_pre)
         sparse_acts.scatter_(dim=-1, index=topk_indices, src=topk_values)
 
-        return sparse_acts
+        return sparse_acts, hidden_pre
 
     def decode(self, feature_acts: torch.Tensor) -> torch.Tensor:
-        """
-        Decode sparse feature activations back to input space.
-
-        Args:
-            feature_acts: Sparse activations of shape (..., d_sae)
-
-        Returns:
-            Reconstructed activations of shape (..., d_in)
-        """
+        """Decode sparse feature activations back to input space."""
         return feature_acts @ self.W_dec + self.b_dec
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Forward pass: encode then decode.
+    def forward(
+        self,
+        x: torch.Tensor,
+        dead_neuron_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Forward pass: encode, decode, and compute losses.
 
         Args:
-            x: Input tensor of shape (..., d_in)
+            x: Input tensor of shape (..., d_in).
+            dead_neuron_mask: Boolean mask of shape (d_sae,) indicating dead
+                features (True = dead). Used for auxiliary TopK loss.
 
         Returns:
-            Tuple of (reconstruction, sparse_activations)
+            Tuple of (reconstruction, sparse_acts, loss, mse_loss, aux_loss).
         """
-        sparse_acts = self.encode(x)
+        sparse_acts, hidden_pre = self.encode(x)
         reconstruction = self.decode(sparse_acts)
-        return reconstruction, sparse_acts
+
+        mse_loss = self._compute_mse_loss(x, reconstruction)
+        aux_loss = torch.tensor(0.0, device=x.device)
+
+        if self.training and dead_neuron_mask is not None:
+            aux_loss = self._compute_aux_topk_loss(
+                x, reconstruction, hidden_pre, dead_neuron_mask
+            )
+
+        loss = mse_loss + aux_loss
+        return reconstruction, sparse_acts, loss, mse_loss, aux_loss
+
+    # ------------------------------------------------------------------
+    # Inference / persistence
+    # ------------------------------------------------------------------
 
     @torch.no_grad()
     def get_feature_activations(self, x: torch.Tensor) -> torch.Tensor:
         """Get sparse feature activations without gradient tracking."""
-        return self.encode(x)
+        sparse_acts, _ = self.encode(x)
+        return sparse_acts
 
     def save(self, path: str):
-        """Save model checkpoint."""
         checkpoint = {
             "config": self.config,
             "state_dict": self.state_dict(),
@@ -131,7 +281,6 @@ class TopKSAE(nn.Module):
 
     @classmethod
     def load(cls, path: str, device: torch.device = None) -> "TopKSAE":
-        """Load model from checkpoint."""
         checkpoint = torch.load(path, map_location=device or "cpu")
         config = checkpoint["config"]
         model = cls(config)
@@ -143,39 +292,38 @@ class TopKSAE(nn.Module):
     def __repr__(self) -> str:
         return (
             f"TopKSAE(d_in={self.d_in}, d_sae={self.d_sae}, k={self.k}, "
-            f"expansion={self.config.expansion_factor}x)"
+            f"expansion={self.config.expansion_factor}x, "
+            f"aux_coeff={self.config.aux_loss_coefficient})"
         )
 
 
 class TopKSAETrainer:
     """
-    Trainer for TopK SAE with decoder weight normalization and metric tracking.
+    Trainer for TopK SAE.
 
-    Optimized for RTX 2080 (Turing) with:
-        - HuggingFace Accelerate for fp16 mixed precision
-        - Fused AdamW optimizer for reduced kernel launches
-        - torch.compile (default mode) for optimized execution
-        - non_blocking transfers for overlapped data movement
+    Training recipe:
+        - fp32 training (no mixed precision)
+        - Adam optimizer (no weight decay needed for SAEs)
+        - Cosine annealing with warmup LR schedule
+        - Dead feature tracking via n_forward_passes_since_fired
+        - Auxiliary TopK loss for dead-feature revival
+        - Train step order: unit norm -> forward -> backward -> clip -> orthogonalize -> step -> schedule
     """
 
     def __init__(
         self,
         model: TopKSAE,
         lr: float = 1e-3,
-        weight_decay: float = 0.0,
-        device: torch.device = None,  # Note: accelerator.device will be used
-        dead_feature_window: int = 1000,  # Reset dead feature stats every N steps
-        compile_model: bool = False,  # Use torch.compile (PyTorch 2.0+)
-        max_grad_norm: float = 1.0,  # Gradient clipping threshold (prevents fp16 overflow)
+        device: torch.device = None,
+        compile_model: bool = False,
+        max_grad_norm: float = 1.0,
+        total_training_steps: int = 0,
+        lr_warmup_steps: int = 500,
+        lr_end_factor: float = 0.1,
     ):
-        # Initialize Accelerator with fp16 (NOT bf16 - Turing doesn't support it natively)
-        self.accelerator = Accelerator(mixed_precision="fp16")
-        self.device = self.accelerator.device
-
-        # Move model to device before compilation
+        self.device = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
         self.model = model.to(self.device)
 
-        # Optionally compile model for faster execution (default mode for Turing stability)
         if compile_model and hasattr(torch, "compile"):
             logger.info("Compiling model with torch.compile (default mode)...")
             compile_start = time.perf_counter()
@@ -183,139 +331,196 @@ class TopKSAETrainer:
             compile_time = time.perf_counter() - compile_start
             logger.info(f"Model compilation completed in {compile_time:.2f}s")
 
-        # Fused AdamW for reduced kernel launch overhead (supported on Turing)
-        self.optimizer = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=lr,
-            weight_decay=weight_decay,
-            fused=True,
-        )
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
 
-        # Prepare model and optimizer with accelerate (handles gradient scaling internally)
-        self.model, self.optimizer = self.accelerator.prepare(
-            self.model, self.optimizer
-        )
-
+        self.lr = lr
         self.max_grad_norm = max_grad_norm
-        self.dead_feature_window = dead_feature_window
-        self.step_counter = 0
-        self.feature_hits = torch.zeros(model.d_sae, device=self.device)
-        self.current_dead_pct = 0.0
+        self.total_training_steps = total_training_steps
+        self.lr_warmup_steps = lr_warmup_steps
+        self.lr_end_factor = lr_end_factor
+
+        if total_training_steps > 0:
+            self.scheduler = get_scheduler(
+                "cosineannealingwarmup",
+                optimizer=self.optimizer,
+                warm_up_steps=lr_warmup_steps,
+                training_steps=total_training_steps,
+                lr_end=lr_end_factor,
+            )
+        else:
+            self.scheduler = get_scheduler("constant", optimizer=self.optimizer)
+
+        # Dead feature tracking
+        self.n_forward_passes_since_fired = torch.zeros(
+            model.d_sae, device=self.device, dtype=torch.long
+        )
+
+    def _get_dead_neuron_mask(self) -> torch.Tensor:
+        """Return boolean mask of features that haven't fired in dead_feature_window steps."""
+        unwrapped = self._unwrap_model()
+        return (self.n_forward_passes_since_fired > unwrapped.config.dead_feature_window).bool()
+
+    def _unwrap_model(self) -> TopKSAE:
+        """Get underlying TopKSAE even if wrapped by torch.compile."""
+        if hasattr(self.model, "_orig_mod"):
+            return self.model._orig_mod
+        return self.model
+
+    def _update_dead_feature_tracking(self, sparse_acts: torch.Tensor):
+        """Update per-feature firing tracker."""
+        with torch.no_grad():
+            did_fire = (sparse_acts > 0).float().sum(dim=0) > 0
+            self.n_forward_passes_since_fired += 1
+            self.n_forward_passes_since_fired[did_fire] = 0
+
+    def initialize_b_dec(self, dataloader, num_tokens: int = 50000):
+        """Initialize b_dec from training data before the training loop."""
+        unwrapped = self._unwrap_model()
+        if unwrapped.config.b_dec_init_method == "zeros":
+            logger.info("b_dec init: zeros (no initialization needed)")
+            return
+
+        logger.info(f"Collecting up to {num_tokens:,} tokens for b_dec initialization...")
+        all_acts = []
+        collected = 0
+        for batch in dataloader:
+            if isinstance(batch, (list, tuple)):
+                batch = batch[0]
+            batch = batch.to(device=self.device, dtype=torch.float32)
+            all_acts.append(batch)
+            collected += batch.shape[0]
+            if collected >= num_tokens:
+                break
+
+        all_acts = torch.cat(all_acts, dim=0)[:num_tokens]
+        logger.info(f"Collected {all_acts.shape[0]:,} tokens for b_dec initialization")
+        unwrapped.initialize_b_dec(all_acts)
+
+    # ------------------------------------------------------------------
+    # Metrics
+    # ------------------------------------------------------------------
 
     def calculate_metrics(
-        self, x: torch.Tensor, reconstruction: torch.Tensor, sparse_acts: torch.Tensor
-    ) -> dict:
-        """
-        Compute Phase 1 training metrics for SAE quality monitoring.
-
-        Metrics computed:
-            - loss (MSE): Mean squared error between input and reconstruction
-            - rel_error: Relative reconstruction error ||x - x_hat|| / ||x||
-            - explained_variance (R²): 1 - Var(residual) / Var(input)
-            - cos_sim: Mean cosine similarity between input and reconstruction
-            - l0: Average number of active features per sample (fixed at k for Top-K)
-            - activation_density: Percentage of dictionary active per sample (l0/d_sae * 100)
-            - l1_norm: Total magnitude of sparse activations (monitors energy drift)
-            - dead_pct: Rolling window percentage of features with zero activations
-        """
+        self,
+        x: torch.Tensor,
+        reconstruction: torch.Tensor,
+        sparse_acts: torch.Tensor,
+        mse_loss: torch.Tensor,
+        aux_loss: torch.Tensor,
+    ) -> Dict[str, float]:
+        """Compute training metrics for SAE quality monitoring."""
         with torch.no_grad():
-            mse = F.mse_loss(reconstruction, x).item()
-            # L0: Average number of active features per sample
+            unwrapped = self._unwrap_model()
             l0 = (sparse_acts > 0).float().sum(dim=-1).mean().item()
             cos_sim = F.cosine_similarity(reconstruction, x, dim=-1).mean().item()
-            # Relative reconstruction error: ||x - x_hat|| / ||x||
             rel_error = (
                 ((reconstruction - x).norm(dim=-1) / (x.norm(dim=-1) + EPSILON))
                 .mean()
                 .item()
             )
 
-            # Explained variance (R^2): 1 - Var(residual) / Var(input)
             residual = x - reconstruction
             residual_var = (residual**2).mean()
             x_centered = x - x.mean(dim=0, keepdim=True)
             total_var = (x_centered**2).mean()
             explained_variance = (1.0 - (residual_var / (total_var + EPSILON))).item()
 
-            unwrapped_model = self.accelerator.unwrap_model(self.model)
-            # Activation density: k/d_sae as percentage
-            activation_density = (l0 / unwrapped_model.d_sae) * 100.0
-            # L1 norm: total energy of sparse activations (monitors feature explosion)
+            activation_density = (l0 / unwrapped.d_sae) * 100.0
             l1_norm = sparse_acts.abs().sum(dim=-1).mean().item()
 
-            # Dead feature tracking (only updated during training)
-            if self.model.training:
-                batch_hits = (sparse_acts > 0).any(dim=0).float()
-                self.feature_hits += batch_hits
-                self.step_counter += 1
-                if self.step_counter % self.dead_feature_window == 0:
-                    dead_count = (self.feature_hits == 0).sum().item()
-                    self.current_dead_pct = (dead_count / unwrapped_model.d_sae) * 100.0
-                    self.feature_hits.zero_()  # Reset for next window
+            dead_mask = self._get_dead_neuron_mask()
+            dead_pct = (dead_mask.sum().item() / unwrapped.d_sae) * 100.0
 
         return {
-            "loss": mse,
+            "loss": (mse_loss + aux_loss).item(),
+            "mse_loss": mse_loss.item(),
+            "ghost_loss": aux_loss.item(),
             "l0": l0,
             "cos_sim": cos_sim,
             "rel_error": rel_error,
             "explained_variance": explained_variance,
             "activation_density": activation_density,
             "l1_norm": l1_norm,
-            "dead_pct": self.current_dead_pct,
+            "dead_pct": dead_pct,
+            "lr": self.optimizer.param_groups[0]["lr"],
         }
 
-    def train_step(self, batch: torch.Tensor) -> dict:
-        """
-        Perform a single training step with fp16 mixed precision via Accelerate.
+    # ------------------------------------------------------------------
+    # Train / eval steps
+    # ------------------------------------------------------------------
+
+    def train_step(self, batch: torch.Tensor) -> Dict[str, float]:
+        """Perform a single training step.
+
+        Step order:
+            1. set_decoder_norm_to_unit_norm
+            2. Forward with dead_neuron_mask
+            3. Update dead feature tracking
+            4. loss.backward()
+            5. Gradient clipping
+            6. remove_gradient_parallel_to_decoder_directions
+            7. optimizer.step()
+            8. scheduler.step()
         """
         self.model.train()
-        batch = batch.to(self.device, non_blocking=True)
+        batch = batch.to(device=self.device, dtype=torch.float32, non_blocking=True)
 
+        unwrapped = self._unwrap_model()
+
+        # 1. Normalize decoder to unit norm before forward
+        unwrapped.set_decoder_norm_to_unit_norm()
+
+        # 2. Forward with dead neuron mask
         self.optimizer.zero_grad()
+        dead_neuron_mask = self._get_dead_neuron_mask()
+        reconstruction, sparse_acts, loss, mse_loss, aux_loss = self.model(
+            batch, dead_neuron_mask
+        )
 
-        # Forward pass in fp16 for speed; loss in float32 to prevent
-        # fp16 overflow when MSE squares large reconstruction errors
-        with self.accelerator.autocast():
-            reconstruction, sparse_acts = self.model(batch)
-        loss = F.mse_loss(reconstruction.float(), batch.float())
+        # 3. Update dead feature tracking
+        self._update_dead_feature_tracking(sparse_acts)
 
-        # Skip step if loss is NaN/Inf (prevents permanent weight corruption)
+        # Skip step if loss is non-finite
         if not torch.isfinite(loss):
             logger.warning(f"Non-finite loss ({loss.item():.4f}), skipping step")
             self.optimizer.zero_grad()
             metrics = self.calculate_metrics(
-                batch, reconstruction.float(), sparse_acts.float()
+                batch, reconstruction, sparse_acts, mse_loss, aux_loss
             )
             metrics["loss"] = float("nan")
             return metrics
 
-        self.accelerator.backward(loss)
+        # 4. Backward
+        loss.backward()
+
+        # 5. Gradient clipping
         if self.max_grad_norm > 0:
-            self.accelerator.clip_grad_norm_(
-                self.model.parameters(), self.max_grad_norm
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), max_norm=self.max_grad_norm
             )
+
+        # 6. Remove gradient parallel to decoder directions
+        unwrapped.remove_gradient_parallel_to_decoder_directions()
+
+        # 7. Optimizer step
         self.optimizer.step()
 
-        # Full precision, outside autocast; unwrap_model needed for accelerate wrapper
-        self.accelerator.unwrap_model(self.model).normalize_decoder_weights()
+        # 8. Scheduler step
+        self.scheduler.step()
 
         metrics = self.calculate_metrics(
-            batch, reconstruction.float(), sparse_acts.float()
+            batch, reconstruction, sparse_acts, mse_loss, aux_loss
         )
-        metrics["loss"] = loss.item()
-
         return metrics
 
     @torch.no_grad()
-    def eval_step(self, batch: torch.Tensor) -> dict:
-        """
-        Perform evaluation step without gradient updates.
-        """
+    def eval_step(self, batch: torch.Tensor) -> Dict[str, float]:
+        """Evaluation step without gradient updates."""
         self.model.eval()
-        batch = batch.to(self.device, non_blocking=True)
+        batch = batch.to(device=self.device, dtype=torch.float32, non_blocking=True)
 
-        reconstruction, sparse_acts = self.model(batch)
-        # Calculate all metrics (without updating dead feature stats since not training)
-        metrics = self.calculate_metrics(batch, reconstruction, sparse_acts)
-
+        reconstruction, sparse_acts, loss, mse_loss, aux_loss = self.model(batch)
+        metrics = self.calculate_metrics(
+            batch, reconstruction, sparse_acts, mse_loss, aux_loss
+        )
         return metrics

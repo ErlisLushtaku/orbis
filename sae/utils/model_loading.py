@@ -76,7 +76,14 @@ def load_sae(
 
     config = checkpoint["config"]
     if isinstance(config, dict):
-        config = TopKSAEConfig(**config)
+        # Filter to only known fields for backward compatibility
+        known_fields = {f.name for f in TopKSAEConfig.__dataclass_fields__.values()}
+        config = TopKSAEConfig(**{k: v for k, v in config.items() if k in known_fields})
+    elif isinstance(config, TopKSAEConfig):
+        # Ensure old checkpoints (missing new fields) get defaults
+        for field_name, field_obj in TopKSAEConfig.__dataclass_fields__.items():
+            if not hasattr(config, field_name):
+                setattr(config, field_name, field_obj.default)
     sae = TopKSAE(config)
 
     state_dict_key = "state_dict" if "state_dict" in checkpoint else "model_state_dict"

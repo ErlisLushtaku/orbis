@@ -696,6 +696,8 @@ def train_epoch(
     epoch_stats = EpochStats(epoch_num=epoch)
     metrics_sum = {
         "loss": 0.0,
+        "mse_loss": 0.0,
+        "ghost_loss": 0.0,
         "l0": 0.0,
         "cos_sim": 0.0,
         "rel_error": 0.0,
@@ -703,6 +705,7 @@ def train_epoch(
         "activation_density": 0.0,
         "l1_norm": 0.0,
         "dead_pct": 0.0,
+        "lr": 0.0,
     }
     # Per-metric valid counts (some metrics can be NaN from fp16 edge cases)
     valid_counts = {k: 0 for k in metrics_sum}
@@ -788,9 +791,10 @@ def eval_epoch(
 ) -> Dict[str, float]:
     """Evaluate on validation set with full Phase 1 metric logging."""
     
-    # All Phase 1 metrics to track
     metrics_sum = {
         "loss": 0.0,
+        "mse_loss": 0.0,
+        "ghost_loss": 0.0,
         "l0": 0.0,
         "cos_sim": 0.0,
         "rel_error": 0.0,
@@ -798,6 +802,7 @@ def eval_epoch(
         "activation_density": 0.0,
         "l1_norm": 0.0,
         "dead_pct": 0.0,
+        "lr": 0.0,
     }
     valid_counts = {k: 0 for k in metrics_sum}
     num_batches = 0
@@ -918,12 +923,17 @@ def _create_sae_and_trainer(
     args: argparse.Namespace,
     hidden_size: int,
     device: torch.device,
+    total_training_steps: int = 0,
 ) -> Tuple[TopKSAE, TopKSAETrainer, TopKSAEConfig]:
     """Instantiate SAE model and trainer."""
     sae_config = TopKSAEConfig(
         d_in=hidden_size,
         expansion_factor=args.expansion_factor,
         k=args.k,
+        dead_feature_window=args.dead_feature_window,
+        aux_loss_coefficient=args.aux_loss_coefficient,
+        normalize_activations=args.normalize_activations,
+        b_dec_init_method=args.b_dec_init,
     )
     sae = TopKSAE(sae_config)
     logger.info(f"Created SAE: {sae}")
@@ -931,12 +941,22 @@ def _create_sae_and_trainer(
     trainer = TopKSAETrainer(
         model=sae,
         lr=args.lr,
-        weight_decay=args.weight_decay,
         device=device,
         compile_model=args.compile,
         max_grad_norm=args.max_grad_norm,
+        total_training_steps=total_training_steps,
+        lr_warmup_steps=args.lr_warmup_steps,
+        lr_end_factor=args.lr_end_factor,
     )
-    logger.info("Accelerate fp16 mixed precision enabled")
+    logger.info("fp32 training with Adam optimizer")
+    logger.info(
+        f"LR schedule: cosine warmup ({args.lr_warmup_steps} warmup steps, "
+        f"end_factor={args.lr_end_factor})"
+    )
+    logger.info(
+        f"Aux TopK loss coefficient: {args.aux_loss_coefficient}, "
+        f"dead_feature_window: {args.dead_feature_window}"
+    )
     if args.compile:
         logger.info("torch.compile enabled")
 
@@ -968,11 +988,16 @@ def _save_experiment_config(
             "d_sae": sae_config.d_sae,
             "expansion_factor": sae_config.expansion_factor,
             "k": sae_config.k,
+            "aux_loss_coefficient": sae_config.aux_loss_coefficient,
+            "dead_feature_window": sae_config.dead_feature_window,
+            "normalize_activations": sae_config.normalize_activations,
+            "b_dec_init_method": sae_config.b_dec_init_method,
         },
         "training": {
             "lr": args.lr,
-            "weight_decay": args.weight_decay,
             "max_grad_norm": args.max_grad_norm,
+            "lr_warmup_steps": args.lr_warmup_steps,
+            "lr_end_factor": args.lr_end_factor,
             "num_epochs": args.num_epochs,
             "batch_size": args.batch_size,
             "eval_every": args.eval_every,
@@ -1105,9 +1130,15 @@ def _run_training_loop(
 
             logger.info(
                 f"Epoch {epoch}/{args.num_epochs} Train: "
-                f"loss={train_metrics['loss']:.4f} l0={train_metrics['l0']:.1f} "
-                f"R\u00b2={train_metrics['explained_variance']:.4f} cos={train_metrics['cos_sim']:.4f} "
-                f"dead%={train_metrics['dead_pct']:.1f} io%={epoch_stats_rec.io_wait_pct:.1f}"
+                f"loss={train_metrics['loss']:.4f} "
+                f"mse={train_metrics.get('mse_loss', 0):.4f} "
+                f"aux={train_metrics.get('ghost_loss', 0):.4f} "
+                f"l0={train_metrics['l0']:.1f} "
+                f"R\u00b2={train_metrics['explained_variance']:.4f} "
+                f"cos={train_metrics['cos_sim']:.4f} "
+                f"dead%={train_metrics['dead_pct']:.1f} "
+                f"lr={train_metrics.get('lr', 0):.2e} "
+                f"io%={epoch_stats_rec.io_wait_pct:.1f}"
             )
             if val_metrics is not None:
                 logger.info(
@@ -1554,9 +1585,15 @@ def main(args: argparse.Namespace, unknown_args: Sequence[str] = ()):
         )
     )
 
-    sae, trainer, sae_config = _create_sae_and_trainer(args, hidden_size, device)
+    total_training_steps = steps_per_epoch * args.num_epochs
+    sae, trainer, sae_config = _create_sae_and_trainer(
+        args, hidden_size, device, total_training_steps=total_training_steps
+    )
     _save_experiment_config(args, exp, sae_config, train_meta, val_meta)
     gpu_monitor = _start_monitoring(args, exp)
+
+    # Initialize b_dec from training data before the training loop
+    trainer.initialize_b_dec(train_act_loader)
 
     history, best_val_loss, training_start = _run_training_loop(
         args, sae, trainer, train_act_loader, val_act_loader,
@@ -1721,10 +1758,26 @@ def parse_args(argv=None):
                         help="Number of training epochs")
     parser.add_argument("--lr", type=float, default=1e-3,
                         help="Learning rate")
-    parser.add_argument("--weight_decay", type=float, default=0.0,
-                        help="Weight decay")
     parser.add_argument("--max_grad_norm", type=float, default=1.0,
                         help="Max gradient norm for clipping (0 to disable)")
+    parser.add_argument("--lr_warmup_steps", type=int, default=500,
+                        help="Number of linear LR warmup steps")
+    parser.add_argument("--lr_end_factor", type=float, default=0.1,
+                        help="End LR as fraction of base LR for cosine schedule (0.1 = lr/10)")
+
+    # SAE-specific training options
+    parser.add_argument("--aux_loss_coefficient", type=float, default=1.0,
+                        help="Coefficient for auxiliary TopK loss (dead-feature revival). "
+                             "Set to 0 to disable. Default: 1.0 (from Gao et al.)")
+    parser.add_argument("--dead_feature_window", type=int, default=5000,
+                        help="Steps without firing before a feature is considered dead")
+    parser.add_argument("--b_dec_init", type=str, default="geometric_median",
+                        choices=["geometric_median", "mean", "zeros"],
+                        help="Method for initializing decoder bias")
+    parser.add_argument("--normalize_activations", type=str, default="none",
+                        choices=["none", "layer_norm"],
+                        help="Input activation normalization before encoding")
+
     parser.add_argument("--sae_batch_size", type=str, default="4096",
                         help="SAE batch size in tokens (default: 4096). "
                              "Use 'auto' to read from calibration resource file.")

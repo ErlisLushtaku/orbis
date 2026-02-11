@@ -411,7 +411,7 @@ def generate_feature_dashboard(
             acts_flat = rearrange(acts, 'b n d -> (b n) d')
             
             # Encode through SAE
-            sparse_acts = sae.encode(acts_flat.to(sae.W_enc.device))
+            sparse_acts = sae.get_feature_activations(acts_flat.to(sae.W_enc.device))
             
             # Reshape back
             sparse_acts = rearrange(sparse_acts, '(b n) f -> b n f', b=B, n=N)

@@ -424,7 +424,7 @@ def collect_activations_from_val_cache(
         acts_batched = acts_flat.view(actual_batch_size, tokens_per_sample, hidden_dim)
 
         # SAE encoding
-        sae_acts = sae.encode(acts_batched)  # (B, tokens_per_sample, d_sae)
+        sae_acts = sae.get_feature_activations(acts_batched)  # (B, tokens_per_sample, d_sae)
         sae_acts_mean = sae_acts.mean(dim=1).cpu().numpy()  # (B, d_sae)
 
         # Spatial tracker: target frame only (last 576 tokens)
@@ -551,7 +551,7 @@ def collect_activations(
         acts = acts.view(b, spatial_tokens, -1)
 
         # SAE encoding -- keep full spatial for tracker
-        sae_acts = sae.encode(acts.float())  # (B, N, d_sae)
+        sae_acts = sae.get_feature_activations(acts.float())  # (B, N, d_sae)
         sae_acts_mean = sae_acts.mean(dim=1).cpu().numpy()  # (B, d_sae)
 
         # For spatial tracker: only the target frame (last 576 tokens)

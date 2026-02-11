@@ -50,15 +50,15 @@ def test_trainer_metrics():
         
         # Create test data
         x = torch.randn(32, 768)
-        reconstruction, sparse_acts = sae(x)
+        reconstruction, sparse_acts, loss, mse_loss, ghost_loss = sae(x)
         
         # Calculate metrics
-        metrics = trainer.calculate_metrics(x, reconstruction, sparse_acts)
+        metrics = trainer.calculate_metrics(x, reconstruction, sparse_acts, mse_loss, ghost_loss)
         
         # Verify all required metrics are present
         required_metrics = [
-            "loss", "l0", "cos_sim", "rel_error",
-            "explained_variance", "activation_density", "l1_norm", "dead_pct"
+            "loss", "mse_loss", "ghost_loss", "l0", "cos_sim", "rel_error",
+            "explained_variance", "activation_density", "l1_norm", "dead_pct", "lr"
         ]
         
         for metric in required_metrics:
