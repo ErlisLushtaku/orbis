@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
 """
-SAE Training Orchestrator: Manages calibration, caching, and training as SLURM jobs.
+SAE Training Orchestrator: Manages calibration, caching, training, and grounding as SLURM jobs.
 
 This script checks cache and calibration status and submits appropriate SLURM jobs:
 1. If calibration resource missing: Submit calibration job first (finds optimal batch size)
 2. If cache is incomplete: Submit cache job (depends on calibration if needed)
 3. Submit train job (depends on cache and uses calibrated batch size)
+4. Optionally submit grounding analysis job (depends on training)
 
 Self-Discovery System:
     - GPU hardware is automatically detected by calibration jobs on compute nodes
     - Partition-to-GPU mappings are stored in logs_sae/resources/partition_map.json
     - Hardware-specific calibration results are shared across partitions with same GPU
 
-Dependency chain: calibrate_batch_size_sae.sh -> cache.sh -> train.sh
+Dependency chain: calibrate_batch_size_sae.sh -> cache.sh -> train.sh [-> grounding.sh] -> grounding.sh
 
 Usage:
     # Full pipeline (calibrate if needed + cache + train)
     python sae/scripts/launch.py --data_source nuplan --layer 22 --k 64 --expansion 16
+    
+    # Full pipeline + grounding analysis after training
+    python sae/scripts/launch.py --data_source nuplan-webdataset --layer 22 --grounding
     
     # Force cache rebuild (with confirmation)
     python sae/scripts/launch.py --data_source covla --layer 12 --rebuild_cache
@@ -26,6 +30,10 @@ Usage:
     
     # Train only (assume cache exists)
     python sae/scripts/launch.py --data_source covla --layer 12 --train_only
+    
+    # Grounding only (on existing trained SAE)
+    python sae/scripts/launch.py --data_source nuplan-webdataset --layer 22 \
+        --grounding_only --sae_barcode topk_x16_k64_s42_20260209_120057
     
     # Skip calibration (use manual --sae_batch_size)
     python sae/scripts/launch.py --data_source nuplan --layer 22 --skip_calibration --sae_batch_size 8192
@@ -56,10 +64,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# =============================================================================
-# Configuration
-# =============================================================================
-
 ORBIS_ROOT = Path(__file__).resolve().parents[2]
 MODEL_NAME = "orbis_288x512"
 
@@ -71,15 +75,12 @@ LOG_BASE = ORBIS_ROOT / "sae" / "slurm" / "logs"
 # Unified script paths (parametric by --data_source)
 CACHE_SCRIPT = ORBIS_ROOT / "sae" / "slurm" / "cache.sh"
 TRAIN_SCRIPT = ORBIS_ROOT / "sae" / "slurm" / "train.sh"
+GROUNDING_SCRIPT = ORBIS_ROOT / "sae" / "slurm" / "grounding.sh"
 CALIBRATE_BATCH_SIZE_SAE_SCRIPT = ORBIS_ROOT / "sae" / "slurm" / "calibrate_batch_size_sae.sh"
 
 # Default partition (used when none specified)
 DEFAULT_PARTITION = "tflmb_gpu-rtx4090"
 
-
-# =============================================================================
-# Helper Functions
-# =============================================================================
 
 def confirm(message: str, default: bool = False) -> bool:
     """
@@ -162,13 +163,15 @@ def get_log_dir(log_type: str, data_source: str, layer: int) -> Path:
     Get log directory path.
     
     Args:
-        log_type: "sae_cache" or "runs"
-        data_source: "nuplan" or "covla"
+        log_type: "sae_cache", "train", or "eval"
+        data_source: Data source name (e.g., "nuplan-webdataset")
         layer: Layer number
     """
     if log_type == "sae_cache":
         return LOG_BASE / "sae_cache" / data_source / MODEL_NAME / f"layer_{layer}"
-    else:  # runs
+    elif log_type == "eval":
+        return LOG_BASE / "runs" / data_source / MODEL_NAME / f"layer_{layer}" / "eval"
+    else:  # train
         return LOG_BASE / "runs" / data_source / MODEL_NAME / f"layer_{layer}" / "train"
 
 
@@ -232,11 +235,6 @@ def submit_job(
         return ""
 
 
-# =============================================================================
-# Calibration Resource Management (Self-Discovery)
-# =============================================================================
-
-# Import batch size calibration utilities (lazy to avoid circular imports)
 _calibrate_batch_size_module = None
 
 def _get_calibrate_batch_size_module():
@@ -344,10 +342,6 @@ def submit_calibration_job(
     )
 
 
-# =============================================================================
-# Main Orchestration Logic
-# =============================================================================
-
 def main():
     parser = argparse.ArgumentParser(
         description="SAE Training Orchestrator: Manage caching and training SLURM jobs"
@@ -390,6 +384,20 @@ def main():
                         help="Shuffle buffer size for WebDataset (default: 500000 tokens). "
                              "Larger = better IID mixing. 500k uses ~1.5GB RAM.")
     
+    # Grounding analysis arguments
+    parser.add_argument("--grounding", action="store_true",
+                        help="Submit grounding analysis job after training completes")
+    parser.add_argument("--grounding_only", action="store_true",
+                        help="Only run grounding (skip cache + train). Requires --sae_barcode.")
+    parser.add_argument("--sae_barcode", type=str, default=None,
+                        help="SAE run barcode for grounding_only mode (e.g., topk_x16_k64_s42_20260209_120057)")
+    parser.add_argument("--grounding_batch_size", type=int, default=4,
+                        help="Batch size for grounding Orbis inference (default: 4)")
+    parser.add_argument("--val_split", type=float, default=0.1,
+                        help="Validation split fraction for grounding (must match training, default: 0.1)")
+    parser.add_argument("--top_k_features", type=int, default=30,
+                        help="Top-K features to report in grounding analysis (default: 30)")
+
     # Orchestration control
     parser.add_argument("--rebuild_cache", action="store_true",
                         help="Force rebuild of activation cache (requires confirmation)")
@@ -413,12 +421,28 @@ def main():
         logger.error("Cannot specify both --cache_only and --train_only")
         sys.exit(1)
     
+    if args.grounding_only:
+        if not args.sae_barcode:
+            logger.error("--grounding_only requires --sae_barcode")
+            sys.exit(1)
+        if args.cache_only or args.train_only:
+            logger.error("--grounding_only cannot be combined with --cache_only or --train_only")
+            sys.exit(1)
+    
+    if args.grounding and args.grounding_only:
+        logger.error("Cannot specify both --grounding and --grounding_only")
+        sys.exit(1)
+    
     # Check script existence
+    need_grounding = args.grounding or args.grounding_only
     if not CACHE_SCRIPT.exists():
         logger.error(f"Cache script not found: {CACHE_SCRIPT}")
         sys.exit(1)
     if not TRAIN_SCRIPT.exists():
         logger.error(f"Train script not found: {TRAIN_SCRIPT}")
+        sys.exit(1)
+    if need_grounding and not GROUNDING_SCRIPT.exists():
+        logger.error(f"Grounding script not found: {GROUNDING_SCRIPT}")
         sys.exit(1)
     
     # Check if using WebDataset mode
@@ -447,7 +471,8 @@ def main():
         val_cache_exists = (cache_dir / "val").exists() and any((cache_dir / "val").glob("batch_*.pt"))
         partial_cache_exists = (train_cache_exists or val_cache_exists) and not cache_complete
     
-    logger.info("=== SAE Training Orchestrator ===")
+    mode_label = "Grounding Analysis" if args.grounding_only else "Training Orchestrator"
+    logger.info(f"=== SAE {mode_label} ===")
     logger.info(f"Data source: {args.data_source}")
     if use_webdataset:
         logger.info(f"  Base source: {base_data_source}")
@@ -503,16 +528,23 @@ def main():
     need_train = not args.cache_only
     skip_cache = args.train_only
     
+    # In grounding_only mode, skip cache and train entirely
+    if args.grounding_only:
+        need_cache = False
+        need_train = False
+        skip_cache = True
+    
     # In WebDataset mode, caching is handled by an offline conversion step.
     # If shards are missing, fail fast with an actionable message.
-    if use_webdataset and not cache_complete and not args.dry_run:
+    # (Skip this check for grounding_only since grounding doesn't need the cache)
+    if use_webdataset and not cache_complete and not args.dry_run and not args.grounding_only:
         logger.error("WebDataset shards not found for this layer.")
         logger.error(f"  Expected train shards under: {cache_dir / 'train'}")
         logger.error("Run the conversion first (or use non-WebDataset data_source):")
         logger.error("  python sae/scripts/convert_to_webdataset.py")
         sys.exit(1)
     
-    if skip_cache and not cache_complete:
+    if skip_cache and not cache_complete and need_train:
         logger.error("--train_only specified but cache is incomplete")
         logger.error(f"  Train meta: {cache_dir / 'train' / '_meta.json'}")
         logger.error(f"  Val meta: {cache_dir / 'val' / '_meta.json'}")
@@ -707,6 +739,62 @@ def main():
             dry_run=args.dry_run,
         )
     
+    # ==========================================================================
+    # Grounding Job Submission
+    # ==========================================================================
+    grounding_job_id = None
+    
+    if args.grounding or args.grounding_only:
+        # Determine the SAE barcode for grounding
+        if args.grounding_only:
+            grounding_barcode = args.sae_barcode
+        elif args.sae_barcode:
+            grounding_barcode = args.sae_barcode
+        else:
+            # Use the barcode generated for the train job
+            grounding_barcode = train_barcode
+        
+        # Verify SAE run directory exists (for grounding_only mode)
+        runs_base = ORBIS_ROOT / "logs_sae" / "runs" / args.data_source / MODEL_NAME / f"layer_{args.layer}"
+        sae_run_dir = runs_base / grounding_barcode
+        sae_checkpoint = sae_run_dir / "best_sae.pt"
+        
+        if args.grounding_only and not sae_checkpoint.exists():
+            logger.error(f"SAE checkpoint not found: {sae_checkpoint}")
+            logger.error("Verify --sae_barcode, --data_source, and --layer are correct.")
+            sys.exit(1)
+        
+        grounding_log_dir = get_log_dir("eval", args.data_source, args.layer)
+        grounding_log_dir.mkdir(parents=True, exist_ok=True)
+        
+        grounding_args = [
+            "--data_source", args.data_source,
+            "--sae_barcode", grounding_barcode,
+            "--layer", str(args.layer),
+            "--batch_size", str(args.grounding_batch_size),
+            "--val_split", str(args.val_split),
+            "--top_k", str(args.top_k_features),
+        ]
+        if args.num_videos:
+            grounding_args.extend(["--num_videos", str(args.num_videos)])
+        
+        # Grounding depends on training completing (if train job was submitted)
+        grounding_dependency = f"afterok:{train_job_id}" if train_job_id else None
+        
+        logger.info(f"Submitting grounding job: {grounding_barcode}")
+        if grounding_dependency:
+            logger.info(f"  Dependency: {grounding_dependency}")
+        
+        grounding_job_id = submit_job(
+            script_path=GROUNDING_SCRIPT,
+            args=grounding_args,
+            job_name=f"sae_eval_{grounding_barcode}",
+            output_path=grounding_log_dir / f"{grounding_barcode}.out",
+            error_path=grounding_log_dir / f"{grounding_barcode}.err",
+            dependency=grounding_dependency,
+            dry_run=args.dry_run,
+        )
+    
     # Summary
     logger.info("=== Summary ===")
     if calibrate_job_id:
@@ -715,14 +803,16 @@ def main():
         logger.info(f"Cache job: {cache_job_id}")
     if train_job_id:
         logger.info(f"Train job: {train_job_id}")
-    if not calibrate_job_id and not cache_job_id and not train_job_id:
+    if grounding_job_id:
+        logger.info(f"Grounding job: {grounding_job_id}")
+    if not calibrate_job_id and not cache_job_id and not train_job_id and not grounding_job_id:
         logger.info("No jobs submitted (dry run or nothing to do)")
     
     if args.sae_batch_size is not None:
         logger.info(f"SAE batch size: {args.sae_batch_size:,} tokens (user-specified)")
     elif use_auto_batch_size:
         logger.info("SAE batch size: auto (will read from calibration resource at runtime)")
-    else:
+    elif not args.grounding_only:
         logger.info("SAE batch size: 4096 tokens (default)")
     
     logger.info("Monitor jobs with: squeue -u $USER")

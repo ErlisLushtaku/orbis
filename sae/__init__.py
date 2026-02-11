@@ -11,6 +11,8 @@ This module provides tools to:
 from .topk_sae import TopKSAE, TopKSAEConfig, TopKSAETrainer
 from .activation_hooks import ActivationExtractor, ActivationIntervenor, ZeroAblationIntervenor
 from .caching import (
+    CacheConfig,
+    CacheResumeInfo,
     prepare_activation_cache,
     load_activation_cache,
     create_activation_dataloader,
@@ -26,48 +28,40 @@ from .metrics import (
     compute_temporal_stability,
     run_full_evaluation,
 )
-from .utils.logging_utils import (
+from .utils.logging import (
     setup_sae_logging,
     get_logger,
-    stats,
-    PhaseTimer,
-    EpochStats,
-    GPUMonitor,
-    TimingStats,
-    phase,
-    timed,
     format_duration,
     format_bytes,
     format_throughput,
+    GPUMonitor,
+    stats,
+    PhaseTimer,
+    EpochStats,
+    TimingStats,
 )
 
 __all__ = [
-    # SAE Model
     "TopKSAE",
     "TopKSAEConfig",
     "TopKSAETrainer",
-    # Activation Extraction & Intervention
     "ActivationExtractor",
     "ActivationIntervenor",
     "ZeroAblationIntervenor",
-    # Caching
+    "CacheConfig",
+    "CacheResumeInfo",
     "prepare_activation_cache",
     "load_activation_cache",
     "create_activation_dataloader",
     "CachedActivationDataset",
     "StreamingActivationDataset",
-    # Metrics - Phase 1 (Training)
     "compute_loss_recovered",
     "compute_dead_features",
     "compute_activation_density",
-    # Metrics - Phase 2 (Evaluation)
     "compute_normalized_loss_recovered",
     "compute_dictionary_coverage",
-    # Metrics - Phase 3 (Analysis)
     "compute_temporal_stability",
-    # Full Evaluation Suite
     "run_full_evaluation",
-    # Logging & Timing
     "setup_sae_logging",
     "get_logger",
     "stats",
@@ -75,8 +69,6 @@ __all__ = [
     "EpochStats",
     "GPUMonitor",
     "TimingStats",
-    "phase",
-    "timed",
     "format_duration",
     "format_bytes",
     "format_throughput",

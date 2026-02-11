@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """Convert PyTorch .pt cache files to WebDataset sharded tar archives.
 
-This script converts a directory of batch_*.pt files into WebDataset format
-for optimized IO performance on NFS clusters. Files are read as raw binary
-and written directly to shards without re-serialization.
+This script converts directories of batch_*.pt files into WebDataset format
+for optimized IO performance on NFS clusters. Supports converting multiple
+splits (e.g., train and val) in a single invocation.
+
+Shard naming follows the convention expected by train_sae.py:
+    {dst_dir}/{split}/layer_{layer}-{split}-%06d.tar
 
 Usage:
-    python convert_to_webdataset.py
-
-Configuration is done via constants at the top of the file.
+    python convert_to_webdataset.py --src_dir /path/to/cache --dst_dir /path/to/wds --layer 12
+    python convert_to_webdataset.py --src_dir /path/to/cache --dst_dir /path/to/wds --layer 22 --splits val
 """
 
+import argparse
 import glob
 import logging
 import os
@@ -19,18 +22,6 @@ import time
 
 from webdataset import ShardWriter
 
-# =============================================================================
-# Configuration
-# =============================================================================
-SRC_DIR = "/work/dlclarge2/lushtake-thesis/orbis/logs_sae/sae_cache/nuplan/orbis_288x512/layer_22/val"
-DST_PATTERN = "/data/lmbraid19/lushtake/sae_wds/layer_22-val-%06d.tar"
-FILE_PATTERN = "batch_*.pt"
-SHARD_MAX_SIZE = 10e9  # 10 GB per shard
-PROGRESS_INTERVAL = 100  # Print progress every N files
-
-# =============================================================================
-# Logging Setup
-# =============================================================================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -38,70 +29,136 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+SHARD_MAX_SIZE_DEFAULT = 10e9  # 10 GB per shard
+FILE_PATTERN = "batch_*.pt"
+PROGRESS_INTERVAL = 100
 
-def main() -> None:
-    """Convert .pt files to WebDataset sharded tar archives."""
-    # Discover and sort files for reproducible sharding order
-    pattern = os.path.join(SRC_DIR, FILE_PATTERN)
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Convert .pt cache files to WebDataset sharded tar archives.",
+    )
+    parser.add_argument(
+        "--src_dir",
+        type=str,
+        required=True,
+        help="Base directory containing split subdirectories with .pt files",
+    )
+    parser.add_argument(
+        "--dst_dir",
+        type=str,
+        required=True,
+        help="Base output directory for WebDataset shards",
+    )
+    parser.add_argument(
+        "--layer",
+        type=int,
+        required=True,
+        help="Layer number (used in shard naming: layer_{N}-{split}-%06d.tar)",
+    )
+    parser.add_argument(
+        "--splits",
+        type=str,
+        default="train,val",
+        help="Comma-separated list of splits to convert (default: train,val)",
+    )
+    parser.add_argument(
+        "--shard_max_size",
+        type=float,
+        default=SHARD_MAX_SIZE_DEFAULT,
+        help=f"Maximum shard size in bytes (default: {SHARD_MAX_SIZE_DEFAULT:.0e})",
+    )
+    return parser.parse_args()
+
+
+def convert_split(
+    src_dir: str,
+    dst_pattern: str,
+    shard_max_size: float,
+) -> None:
+    """Convert .pt files from a single split directory to WebDataset shards."""
+    pattern = os.path.join(src_dir, FILE_PATTERN)
     logger.info(f"Searching for files matching: {pattern}")
-    
+
     files = sorted(glob.glob(pattern))
     num_files = len(files)
-    
+
     if num_files == 0:
         logger.error(f"No files found matching pattern: {pattern}")
         sys.exit(1)
-    
+
     logger.info(f"Found {num_files} files to convert")
-    
-    # Calculate expected number of shards (approximate)
+
     sample_size = os.path.getsize(files[0])
-    estimated_shards = (num_files * sample_size) / SHARD_MAX_SIZE
+    estimated_shards = (num_files * sample_size) / shard_max_size
     logger.info(f"Sample file size: {sample_size / 1e6:.2f} MB")
     logger.info(f"Estimated number of shards: ~{int(estimated_shards) + 1}")
-    
-    # Ensure output directory exists
-    dst_dir = os.path.dirname(DST_PATTERN)
+
+    dst_dir = os.path.dirname(dst_pattern)
     os.makedirs(dst_dir, exist_ok=True)
-    logger.info(f"Output directory: {dst_dir}")
-    
-    # Convert files to WebDataset shards
+    logger.info(f"Output pattern: {dst_pattern}")
+
     start_time = time.time()
     bytes_written = 0
-    
-    with ShardWriter(DST_PATTERN, maxsize=SHARD_MAX_SIZE, verbose=1) as sink:
+
+    with ShardWriter(dst_pattern, maxsize=shard_max_size, verbose=1) as sink:
         for i, fpath in enumerate(files):
-            # Progress logging
             if i % PROGRESS_INTERVAL == 0:
                 elapsed = time.time() - start_time
                 rate = bytes_written / elapsed / 1e6 if elapsed > 0 else 0
                 logger.info(
-                    f"Progress: {i}/{num_files} files ({i/num_files*100:.1f}%) | "
+                    f"Progress: {i}/{num_files} files ({i / num_files * 100:.1f}%) | "
                     f"Rate: {rate:.1f} MB/s | "
                     f"File: {os.path.basename(fpath)}"
                 )
-            
-            # Read file as raw binary (passthrough without re-encoding)
+
             with open(fpath, "rb") as f:
                 data = f.read()
-            
+
             bytes_written += len(data)
-            
-            # Use basename without extension as the sample key
             key = os.path.splitext(os.path.basename(fpath))[0]
-            
-            # Write to shard - bytes pass through encoder unchanged
             sink.write({"__key__": key, "pt": data})
-    
-    # Final statistics
+
     elapsed = time.time() - start_time
+    logger.info(f"Split complete: {num_files} files, {bytes_written / 1e9:.2f} GB, "
+                f"{elapsed / 60:.1f} min, {bytes_written / elapsed / 1e6:.1f} MB/s")
+
+
+def main() -> None:
+    args = parse_args()
+    splits = [s.strip() for s in args.splits.split(",")]
+
+    logger.info(f"Source directory: {args.src_dir}")
+    logger.info(f"Destination directory: {args.dst_dir}")
+    logger.info(f"Layer: {args.layer}")
+    logger.info(f"Splits: {splits}")
+    logger.info(f"Shard max size: {args.shard_max_size / 1e9:.1f} GB")
+
+    for split in splits:
+        split_src = os.path.join(args.src_dir, split)
+        if not os.path.isdir(split_src):
+            logger.error(f"Source split directory does not exist: {split_src}")
+            sys.exit(1)
+
+        split_dst_dir = os.path.join(args.dst_dir, split)
+        dst_pattern = os.path.join(
+            split_dst_dir, f"layer_{args.layer}-{split}-%06d.tar"
+        )
+
+        logger.info("=" * 60)
+        logger.info(f"Converting split: {split}")
+        logger.info(f"  Source: {split_src}")
+        logger.info(f"  Destination pattern: {dst_pattern}")
+        logger.info("=" * 60)
+
+        convert_split(
+            src_dir=split_src,
+            dst_pattern=dst_pattern,
+            shard_max_size=args.shard_max_size,
+        )
+
     logger.info("=" * 60)
-    logger.info("Conversion complete!")
-    logger.info(f"Total files converted: {num_files}")
-    logger.info(f"Total data written: {bytes_written / 1e9:.2f} GB")
-    logger.info(f"Total time: {elapsed / 60:.1f} minutes")
-    logger.info(f"Average rate: {bytes_written / elapsed / 1e6:.1f} MB/s")
-    logger.info(f"Output pattern: {DST_PATTERN}")
+    logger.info("All splits converted successfully!")
 
 
 if __name__ == "__main__":

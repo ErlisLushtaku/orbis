@@ -40,10 +40,6 @@ from sae.topk_sae import TopKSAE, TopKSAEConfig
 logger = logging.getLogger(__name__)
 
 
-# =============================================================================
-# SAE OOM Testing
-# =============================================================================
-
 def sae_causes_oom(
     sae_config: TopKSAEConfig,
     batch_size: int,
@@ -165,10 +161,6 @@ def calibrate_sae_batch_size(
     )
 
 
-# =============================================================================
-# Resource Path Management
-# =============================================================================
-
 def get_sae_resource_dir(
     layer: int,
     expansion_factor: int,
@@ -251,10 +243,6 @@ def create_sae_resource_data(
     }
 
 
-# =============================================================================
-# CLI Entry Point
-# =============================================================================
-
 def _parse_args() -> argparse.Namespace:
     """Parse command line arguments for SAE calibration."""
     parser = argparse.ArgumentParser(
@@ -311,7 +299,7 @@ def _parse_args() -> argparse.Namespace:
 def main() -> int:
     """CLI entry point for SAE batch size calibration."""
     from sae.calibrate_batch_size.runner import run_calibration
-    from sae.utils.logging_utils import get_logger, setup_sae_logging
+    from sae.utils.logging import get_logger, setup_sae_logging
     
     args = _parse_args()
     setup_sae_logging(level="INFO")

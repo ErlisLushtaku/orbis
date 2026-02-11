@@ -38,6 +38,10 @@ def load_history(history_path: Path) -> List[Dict]:
         return json.load(f)
 
 
+# Timing/metadata fields that should not be plotted as training metrics
+_NON_METRIC_FIELDS = {"eval_time_s"}
+
+
 def extract_metrics(history: List[Dict]) -> Dict[str, Dict[str, List]]:
     """
     Extract train and val metrics from history.
@@ -54,6 +58,8 @@ def extract_metrics(history: List[Dict]) -> Dict[str, Dict[str, List]]:
         # Extract train metrics
         if entry.get("train"):
             for key, value in entry["train"].items():
+                if key in _NON_METRIC_FIELDS:
+                    continue
                 if key not in metrics["train"]:
                     metrics["train"][key] = {"epochs": [], "values": []}
                 metrics["train"][key]["epochs"].append(epoch)
@@ -62,6 +68,8 @@ def extract_metrics(history: List[Dict]) -> Dict[str, Dict[str, List]]:
         # Extract val metrics (may be None for some epochs)
         if entry.get("val"):
             for key, value in entry["val"].items():
+                if key in _NON_METRIC_FIELDS:
+                    continue
                 if key not in metrics["val"]:
                     metrics["val"][key] = {"epochs": [], "values": []}
                 metrics["val"][key]["epochs"].append(epoch)
@@ -142,6 +150,10 @@ def plot_all_metrics(
         "l0": "L0 (Active Features)",
         "cos_sim": "Cosine Similarity",
         "rel_error": "Relative Error",
+        "explained_variance": "Explained Variance (R^2)",
+        "activation_density": "Activation Density (%)",
+        "l1_norm": "L1 Norm",
+        "dead_pct": "Dead Features (%)",
     }
     
     for idx, metric_name in enumerate(sorted(all_metrics)):
@@ -217,6 +229,10 @@ def plot_history(history_path: Path) -> Path:
         "l0": {"title": "L0 Sparsity", "ylabel": "Active Features"},
         "cos_sim": {"title": "Cosine Similarity", "ylabel": "Cosine Similarity"},
         "rel_error": {"title": "Relative Reconstruction Error", "ylabel": "Relative Error"},
+        "explained_variance": {"title": "Explained Variance", "ylabel": "R^2"},
+        "activation_density": {"title": "Activation Density", "ylabel": "Density (%)"},
+        "l1_norm": {"title": "L1 Norm", "ylabel": "L1 Norm"},
+        "dead_pct": {"title": "Dead Features", "ylabel": "Dead (%)"},
     }
     
     for metric_name in metrics["train"].keys():

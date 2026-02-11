@@ -22,10 +22,6 @@ from sae.utils.file_lock import atomic_json_file
 
 logger = logging.getLogger(__name__)
 
-# =============================================================================
-# Constants
-# =============================================================================
-
 ORBIS_ROOT = Path(__file__).resolve().parents[2]
 
 # Partition maps for each resource directory
@@ -40,10 +36,6 @@ PARTITION_MAP_PATH = SAE_PARTITION_MAP_PATH
 DEFAULT_MODEL_NAME = "orbis_288x512"
 DEFAULT_HIDDEN_SIZE = 768  # Hidden size for orbis_288x512
 
-
-# =============================================================================
-# GPU Information
-# =============================================================================
 
 @dataclass
 class GPUInfo:
@@ -108,10 +100,6 @@ def get_gpu_info() -> GPUInfo:
     
     return GPUInfo(name=name, vram_gb=vram_gb, slug=slug)
 
-
-# =============================================================================
-# Partition Map (Self-Discovery)
-# =============================================================================
 
 def get_current_partition() -> Optional[str]:
     """
@@ -196,10 +184,6 @@ def resolve_partition_to_gpu_slug(
     return mapping.get(partition)
 
 
-# =============================================================================
-# Generic Calibration Algorithm
-# =============================================================================
-
 def calibrate(
     oom_test_fn: Callable[[int], bool],
     baseline: int = 512,
@@ -274,10 +258,6 @@ def calibrate(
     return max_batch, recommended
 
 
-# =============================================================================
-# GPU Cleanup
-# =============================================================================
-
 def cleanup_gpu() -> None:
     """
     Force GPU memory cleanup between OOM tests.
@@ -296,10 +276,6 @@ def cleanup_gpu() -> None:
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
 
-
-# =============================================================================
-# Resource File Management
-# =============================================================================
 
 def save_resource_atomic(path: Path, data: Dict[str, Any]) -> None:
     """

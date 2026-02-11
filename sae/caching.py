@@ -26,14 +26,13 @@ from tqdm import tqdm
 from einops import rearrange
 
 from .activation_hooks import ActivationExtractor
-from .utils.logging_utils import get_logger, format_duration, format_bytes, format_throughput
+from .utils.constants import CACHED_BATCH_SIZE, CACHE_SAVE_INTERVAL, SHARD_SHUFFLE_SIZE
+from .utils.data_utils import extract_batch_images
+from .utils.logging import get_logger, format_duration, format_bytes, format_throughput
 
 logger = get_logger(__name__)
 
 
-# =============================================================================
-# Cache Resume Info
-# =============================================================================
 
 @dataclass
 class CacheResumeInfo:
@@ -53,6 +52,44 @@ class CacheResumeInfo:
     hidden_dim: Optional[int]
     is_complete: bool
     valid_files: List[Path]
+
+    @staticmethod
+    def fresh() -> "CacheResumeInfo":
+        """Create a fresh resume state for a new cache (no prior work)."""
+        return CacheResumeInfo(
+            start_batch_idx=0,
+            start_sample_idx=0,
+            total_tokens=0,
+            hidden_dim=None,
+            is_complete=False,
+            valid_files=[],
+        )
+
+
+@dataclass
+class CacheConfig:
+    """Configuration for activation caching.
+    
+    Groups cache-level settings that are invariant between train/val splits:
+    model configuration, storage format, and reproducibility metadata.
+    """
+    layer_idx: int
+    dtype: torch.dtype
+    dtype_name: str
+    t_noise: float = 0.0
+    frame_rate: int = 5
+    show_progress: bool = True
+    # Reproducibility metadata (stored in _meta.json)
+    seed: int = 42
+    orbis_exp_dir: Optional[str] = None
+    data_source: Optional[str] = None
+    data_dir: Optional[str] = None
+    num_videos: Optional[int] = None
+    num_frames: int = 6
+    val_split: float = 0.1
+    source_size: Optional[Tuple[int, int]] = None
+    input_size: Tuple[int, int] = (288, 512)
+    stored_frame_rate: Optional[int] = None
 
 
 def get_cache_resume_info(
@@ -80,13 +117,10 @@ def get_cache_resume_info(
     cache_dir.mkdir(parents=True, exist_ok=True)
     meta_file = cache_dir / "_meta.json"
     progress_file = cache_dir / "_progress.json"
-    
-    # Calculate expected total batches
-    total_batches = (total_samples + batch_size - 1) // batch_size  # ceil division
-    
-    # Handle rebuild flag - return fresh start
+
+    total_batches = (total_samples + batch_size - 1) // batch_size
+
     if rebuild:
-        # Clean existing cache
         for path in cache_dir.glob("*.pt"):
             path.unlink()
         if meta_file.exists():
@@ -103,11 +137,9 @@ def get_cache_resume_info(
             valid_files=[],
         )
     
-    # Check for existing files
     existing_files = sorted(cache_dir.glob("batch_*.pt"))
     num_existing = len(existing_files)
-    
-    # Handle empty cache (fresh start)
+
     if not existing_files:
         logger.info(f"No existing cache at {cache_dir}")
         return CacheResumeInfo(
@@ -119,13 +151,12 @@ def get_cache_resume_info(
             valid_files=[],
         )
     
-    # Check if cache is complete according to metadata
     if meta_file.exists():
         try:
             with meta_file.open("r") as f:
                 meta = json.load(f)
             
-            # Safety check: verify batch_size matches
+            # Safety check: verify batch_size matches to prevent cache corruption
             cached_batch_size = meta.get("batch_size")
             if cached_batch_size is not None and cached_batch_size != batch_size:
                 raise ValueError(
@@ -135,7 +166,6 @@ def get_cache_resume_info(
                     f"2) Use the same batch_size as the original run."
                 )
             
-            # Check if complete
             if meta["num_files"] == num_existing and num_existing >= total_batches:
                 logger.info(f"Using complete existing cache from {cache_dir} ({num_existing} files)")
                 return CacheResumeInfo(
@@ -149,10 +179,7 @@ def get_cache_resume_info(
         except json.JSONDecodeError:
             logger.warning("Metadata corrupted, re-scanning files.")
     
-    # === GAP DETECTION & RESUME LOGIC ===
     logger.info(f"Found {num_existing} existing files. Verifying integrity...")
-    
-    # Get actual indices present on disk
     actual_indices = sorted([int(f.stem.split('_')[1]) for f in existing_files])
     
     if not actual_indices:
@@ -167,22 +194,18 @@ def get_cache_resume_info(
                 break
         
         if first_gap == -1:
-            # No gaps found - resume from next index
             start_batch_idx = len(actual_indices)
             valid_files = existing_files
         else:
-            # Gap detected!
             logger.warning(f"Gap detected at batch index {first_gap}. Resuming from there.")
             start_batch_idx = first_gap
             valid_files = [f for f in existing_files if int(f.stem.split('_')[1]) < first_gap]
     
-    # Recover token counts and hidden_dim
     total_tokens = 0
     hidden_dim: Optional[int] = None
-    
+
     if valid_files:
         num_files = len(valid_files)
-        
         # Try reading from progress file first (fast path)
         if progress_file.exists():
             try:
@@ -202,7 +225,7 @@ def get_cache_resume_info(
                 logger.warning(f"Progress file corrupted ({e}), re-scanning...")
                 progress_file.unlink()
         
-        # If we still need to recover tokens (no valid progress file), scan all files
+        # If no valid progress file, scan all files to recover tokens
         if total_tokens == 0:
             logger.info(f"Recovering token counts from {num_files} files...")
             for f in tqdm(valid_files, desc="Scanning cache", leave=False):
@@ -230,9 +253,7 @@ def get_cache_resume_info(
                             total_tokens += data.shape[0]
                     break
     
-    # Calculate start sample index
     start_sample_idx = start_batch_idx * batch_size
-    
     # Check if we're already done (extension case where cache >= needed)
     is_complete = start_batch_idx >= total_batches
     
@@ -302,8 +323,8 @@ class StreamingActivationDataset(Dataset):
         self.files: List[Path] = list(files)
         self.output_dtype = output_dtype
         
-        # Build cumulative index for variable-sized files
-        self._file_offsets: List[int] = [0]  # Start offset for each file
+        # Cumulative index for variable-sized files (start offset for each file)
+        self._file_offsets: List[int] = [0]
         self._file_sizes: List[int] = []
         
         if total_tokens is not None:
@@ -373,29 +394,9 @@ def prepare_activation_cache(
     model: nn.Module,
     dataloader: DataLoader,
     cache_dir: Path,
-    layer_idx: int,
+    config: CacheConfig,
+    resume: CacheResumeInfo,
     device: torch.device,
-    dtype: torch.dtype,
-    dtype_name: str,
-    t_noise: float = 0.0,
-    frame_rate: int = 5,
-    show_progress: bool = True,
-    # Resume parameters (from CacheResumeInfo)
-    start_batch_idx: int = 0,
-    existing_tokens: int = 0,
-    existing_files: Optional[List[Path]] = None,
-    existing_hidden_dim: Optional[int] = None,
-    # Reproducibility parameters (stored in _meta.json)
-    seed: int = 42,
-    orbis_exp_dir: Optional[str] = None,
-    data_source: Optional[str] = None,
-    data_dir: Optional[str] = None,
-    num_videos: Optional[int] = None,
-    num_frames: int = 6,
-    val_split: float = 0.1,
-    source_size: Optional[Tuple[int, int]] = None,
-    input_size: Tuple[int, int] = (288, 512),
-    stored_frame_rate: Optional[int] = None,
 ) -> List[Path]:
     """
     Precompute and store ST-Transformer activations for SAE training.
@@ -408,27 +409,9 @@ def prepare_activation_cache(
         model: Orbis world model (will be put in eval mode)
         dataloader: DataLoader yielding batches of images (may be subsetted for resume)
         cache_dir: Directory to store cached activations
-        layer_idx: Which transformer block to extract from
+        config: Cache configuration (layer, dtype, noise, metadata for reproducibility)
+        resume: Resume state from get_cache_resume_info (batch offset, existing files/tokens)
         device: Device to run inference on
-        dtype: Storage dtype for cached activations
-        dtype_name: String name of dtype (for metadata)
-        t_noise: Noise timestep for denoising
-        frame_rate: Frame rate conditioning value
-        show_progress: Whether to show progress bar
-        start_batch_idx: Batch index offset for file naming (from CacheResumeInfo)
-        existing_tokens: Number of tokens already cached (from CacheResumeInfo)
-        existing_files: List of existing cache files (from CacheResumeInfo)
-        existing_hidden_dim: Hidden dim from existing files (from CacheResumeInfo)
-        seed: Random seed for noise generation (for reproducibility)
-        orbis_exp_dir: Path to Orbis experiment directory (for metadata)
-        data_source: Data source type ("covla", "nuplan", etc.)
-        data_dir: Path to source data directory
-        num_videos: Number of videos used
-        num_frames: Number of frames per clip
-        val_split: Validation split fraction
-        source_size: Original video resolution (H, W) before transforms
-        input_size: Target resolution (H, W) after transforms
-        stored_frame_rate: Native FPS of source videos
         
     Returns:
         List of paths to ALL cached activation files (existing + new)
@@ -439,71 +422,49 @@ def prepare_activation_cache(
     progress_file = cache_dir / "_progress.json"
     
     # Set seed for reproducible noise generation
-    torch.manual_seed(seed)
-    
-    # Get batch_size from dataloader for metadata
+    torch.manual_seed(config.seed)
     batch_size = dataloader.batch_size
-    
-    # Initialize from existing state
-    saved_paths: List[Path] = list(existing_files) if existing_files else []
-    total_tokens = existing_tokens
-    hidden_dim = existing_hidden_dim
-    
-    # Calculate total batches for progress bar
+
+    saved_paths: List[Path] = list(resume.valid_files)
+    total_tokens = resume.total_tokens
+    hidden_dim = resume.hidden_dim
+
     num_new_batches = len(dataloader)
-    total_batches = start_batch_idx + num_new_batches
-    
-    # Early return if nothing to do
+    total_batches = resume.start_batch_idx + num_new_batches
+
     if num_new_batches == 0:
         logger.info("Nothing to cache (dataloader is empty)")
         return saved_paths
     
     logger.info(f"Caching {num_new_batches} batches "
-                f"(batch {start_batch_idx} to {total_batches - 1}) to {cache_dir}")
+                f"(batch {resume.start_batch_idx} to {total_batches - 1}) to {cache_dir}")
     
-    # Setup model and extractor
     model.eval()
-    extractor = ActivationExtractor(model, layer_idx=layer_idx, flatten_spatial=True)
-    
-    # Setup progress bar
+    extractor = ActivationExtractor(model, layer_idx=config.layer_idx, flatten_spatial=True)
+
     pbar = None
-    if show_progress:
+    if config.show_progress:
         pbar = tqdm(
             total=total_batches,
-            initial=start_batch_idx,
+            initial=resume.start_batch_idx,
             desc="Caching activations",
             unit="batch",
         )
     
-    # Process batches with correct index offset for file naming
-    for batch_idx, batch in enumerate(dataloader, start=start_batch_idx):
-        # Handle different batch formats
-        if isinstance(batch, (list, tuple)):
-            imgs = batch[0]
-        elif isinstance(batch, dict):
-            imgs = batch.get('images', batch.get('image'))
-        else:
-            imgs = batch
-        
-        imgs = imgs.to(device, non_blocking=True)
-        
-        # Encode frames through tokenizer
+    # Process batches with index offset for correct file naming during resume
+    for batch_idx, batch in enumerate(dataloader, start=resume.start_batch_idx):
+        imgs = extract_batch_images(batch).to(device, non_blocking=True)
         x = model.encode_frames(imgs)
-        
-        # Prepare for denoising step
+
         b = x.shape[0]
-        t = torch.full((b,), t_noise, device=device)
-        
+        t = torch.full((b,), config.t_noise, device=device)
         # Always add noise to match training distribution (sigma_min at t=0)
         target_t, _ = model.add_noise(x, t)
-        
-        # Ensure correct shape for vit input
+
         if target_t.dim() == 4:
             target_t = target_t.unsqueeze(1)
         
-        # Run through transformer with activation capture
-        fr = torch.full((b,), frame_rate, device=device)
-        
+        fr = torch.full((b,), config.frame_rate, device=device)
         with extractor.capture():
             # Context is previous frames (if multi-frame)
             if target_t.shape[1] > 1:
@@ -515,76 +476,68 @@ def prepare_activation_cache(
             
             _ = model.vit(target, context, t, frame_rate=fr)
         
-        # Get flattened activations: (batch * frames * spatial, hidden_dim)
+        # Flattened activations: (batch * frames * spatial, hidden_dim)
         activations = extractor.get_activations()
-        activations = activations.to(dtype=dtype).cpu()
+        activations = activations.to(dtype=config.dtype).cpu()
         
         if hidden_dim is None:
             hidden_dim = activations.shape[-1]
         
-        # Save to disk with correct batch index
         path = cache_dir / f"batch_{batch_idx:06d}.pt"
         torch.save({"activations": activations}, path)
         saved_paths.append(path)
         total_tokens += activations.shape[0]
         
-        # Save progress periodically (every 100 batches) for fast resume
-        if (batch_idx + 1) % 100 == 0:
+        # Save progress periodically for fast resume
+        if (batch_idx + 1) % CACHE_SAVE_INTERVAL == 0:
             progress = {
                 "num_files": len(saved_paths),
                 "total_tokens": total_tokens,
                 "hidden_dim": hidden_dim,
                 "last_batch_idx": batch_idx,
-                "seed": seed,  # Include seed for resume
+                "seed": config.seed,  # Include seed for resume
             }
             with progress_file.open("w", encoding="utf-8") as f:
                 json.dump(progress, f)
         
-        # Update progress bar
         if pbar is not None:
             pbar.update(1)
     
     if pbar is not None:
         pbar.close()
     
-    # Save final metadata with full reproducibility config (atomic write)
     meta = {
-        # Cache statistics
         "num_files": len(saved_paths),
         "total_tokens": total_tokens,
         "hidden_dim": hidden_dim,
-        "dtype": dtype_name,
+        "dtype": config.dtype_name,
         "batch_size": batch_size,
-        # Model config
-        "layer_idx": layer_idx,
-        "t_noise": t_noise,
-        "frame_rate": frame_rate,
-        "orbis_exp_dir": orbis_exp_dir,
-        # Data config
-        "data_source": data_source,
-        "data_dir": data_dir,
-        "num_videos": num_videos,
-        "num_frames": num_frames,
-        "val_split": val_split,
-        "source_size": list(source_size) if source_size else None,
-        "input_size": list(input_size) if input_size else None,
-        "stored_frame_rate": stored_frame_rate,
-        # Reproducibility
-        "seed": seed,
+        "layer_idx": config.layer_idx,
+        "t_noise": config.t_noise,
+        "frame_rate": config.frame_rate,
+        "orbis_exp_dir": config.orbis_exp_dir,
+        "data_source": config.data_source,
+        "data_dir": config.data_dir,
+        "num_videos": config.num_videos,
+        "num_frames": config.num_frames,
+        "val_split": config.val_split,
+        "source_size": list(config.source_size) if config.source_size else None,
+        "input_size": list(config.input_size) if config.input_size else None,
+        "stored_frame_rate": config.stored_frame_rate,
+        "seed": config.seed,
     }
-    # Write atomically using temp file + os.replace() for crash safety
+
+    # Atomic write via temp file + os.replace() for crash safety
     fd, tmp_path = tempfile.mkstemp(dir=cache_dir, suffix='.tmp')
     try:
         with os.fdopen(fd, 'w') as f:
             json.dump(meta, f, indent=2)
         os.replace(tmp_path, meta_file)
     except Exception:
-        # Clean up temp file on error
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
         raise
-    
-    # Remove progress file now that we have complete metadata
+
     if progress_file.exists():
         progress_file.unlink()
     
@@ -727,11 +680,6 @@ def create_activation_dataloader(
     return dataloader, meta
 
 
-# =============================================================================
-# WebDataset Loader (for sharded tar archives)
-# =============================================================================
-
-
 def _pt_decoder(data: bytes) -> torch.Tensor:
     """
     Custom decoder for .pt files containing {"activations": tensor}.
@@ -764,7 +712,7 @@ def create_webdataset_dataloader(
     num_workers: int = 4,
     seed: int = 42,
     pin_memory: bool = True,
-    cached_batch_size: int = 13824,
+    cached_batch_size: int = CACHED_BATCH_SIZE,
 ) -> Tuple[Any, Dict[str, Any]]:
     """
     Create a WebDataset-based dataloader with shard and buffer shuffling.
@@ -843,7 +791,7 @@ def create_webdataset_dataloader(
     
     # Pipeline: unbatch → shuffle → rebatch
     # We unbatch because cached files contain sequential correlated tokens
-    shardshuffle = 100 if shuffle_buffer > 0 else 0
+    shardshuffle = SHARD_SHUFFLE_SIZE if shuffle_buffer > 0 else 0
     dataset = wds.WebDataset(
         shard_pattern,
         shardshuffle=shardshuffle,

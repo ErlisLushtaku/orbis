@@ -47,7 +47,7 @@ if str(ORBIS_ROOT) not in sys.path:
 
 from omegaconf import OmegaConf
 from util import instantiate_from_config
-from sae.utils.logging_utils import get_logger, setup_sae_logging
+from sae.utils.logging import get_logger, setup_sae_logging
 
 # Setup logging
 setup_sae_logging()

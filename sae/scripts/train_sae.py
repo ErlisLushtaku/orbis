@@ -23,19 +23,17 @@ import argparse
 import json
 import logging
 import math
-import os
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, Subset
-from omegaconf import OmegaConf
 from tqdm import tqdm
 
-# Add project root to path (scripts are in sae/scripts/, so go up 3 levels for project, 2 for orbis)
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 ORBIS_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
@@ -43,12 +41,11 @@ if str(PROJECT_ROOT) not in sys.path:
 if str(ORBIS_ROOT) not in sys.path:
     sys.path.insert(0, str(ORBIS_ROOT))
 
-from util import instantiate_from_config
 from pytorch_lightning import seed_everything
 
-# Local imports (use absolute imports for script execution)
 from sae.topk_sae import TopKSAE, TopKSAEConfig, TopKSAETrainer
 from sae.caching import (
+    CacheConfig,
     CacheResumeInfo,
     get_cache_resume_info,
     prepare_activation_cache,
@@ -56,22 +53,17 @@ from sae.caching import (
     create_webdataset_dataloader,
     resolve_cache_dtype,
 )
-# Phase 2 metrics (NLR, coverage) are available in sae.metrics for standalone
-# evaluation scripts but are not used inline during training. See docs/ToDo.md.
-from sae.utils.logging_utils import (
-    setup_sae_logging,
-    get_logger,
-    stats,
-    PhaseTimer,
-    EpochStats,
-    GPUMonitor,
-    format_duration,
-    format_bytes,
+from sae.utils.constants import (
+    BYTES_PER_FLOAT16,
+    DEFAULT_NUM_WORKERS,
+    DEFAULT_SAE_BATCH_SIZE,
 )
+from sae.utils.data_utils import is_webdataset_mode, get_base_data_source
+from sae.utils.model_loading import load_orbis_model
+from sae.utils.logging import get_logger, format_duration, GPUMonitor, stats, EpochStats
 
 logger = get_logger(__name__)
 
-# Import datasets
 from semantic_stage2 import CityScapes
 from data.custom_multiframe import (
     MultiHDF5DatasetMultiFrameRandomizeFrameRate,
@@ -82,28 +74,13 @@ from data.covla.covla_dataset import CoVLAOrbisMultiFrame
 from data.nuplan.nuplan_dataset import NuPlanOrbisMultiFrame
 
 
-# =============================================================================
-# Helper Functions for Data Source and Batch Size Resolution
-# =============================================================================
-
-def is_webdataset_mode(data_source: str) -> bool:
-    """Check if data_source uses WebDataset format (ends with '-webdataset')."""
-    return data_source.endswith("-webdataset")
-
-
-def get_base_data_source(data_source: str) -> str:
-    """Get base data source name (without -webdataset suffix)."""
-    if data_source.endswith("-webdataset"):
-        return data_source[:-len("-webdataset")]
-    return data_source
-
 
 def resolve_sae_batch_size(
     batch_size_arg: str,
     layer: int,
     expansion: int,
     k: int,
-    default: int = 4096,
+    default: int = DEFAULT_SAE_BATCH_SIZE,
 ) -> int:
     """
     Resolve SAE batch size from argument.
@@ -154,40 +131,6 @@ def resolve_sae_batch_size(
             raise
 
 
-def load_orbis_model(
-    config_path: str,
-    ckpt_path: str,
-    device: torch.device,
-) -> nn.Module:
-    """
-    Load pre-trained Orbis world model.
-    
-    Args:
-        config_path: Path to model config.yaml
-        ckpt_path: Path to model checkpoint
-        device: Device to load model on
-        
-    Returns:
-        Loaded model in eval mode with frozen parameters
-    """
-    logger.info(f"Loading config from {config_path}")
-    cfg_model = OmegaConf.load(config_path)
-
-    logger.info("Instantiating model...")
-    model = instantiate_from_config(cfg_model.model)
-
-    logger.info(f"Loading checkpoint from {ckpt_path}")
-    state_dict = torch.load(ckpt_path, map_location="cpu")["state_dict"]
-    model.load_state_dict(state_dict, strict=False)
-
-    # Freeze model and move to device
-    model = model.to(device)
-    model.eval()
-    for param in model.parameters():
-        param.requires_grad = False
-
-    logger.info("Model loaded and frozen")
-    return model
 
 
 def create_dataloaders_cityscapes(
@@ -619,12 +562,11 @@ def create_dataloaders(
     nuplan_data_dir: Optional[str] = None,
     num_videos: Optional[int] = None,
 ) -> tuple:
-    """
-    Create dataloaders based on data source type.
+    """Create dataloaders based on data source type.
 
     Args:
         data_source: "cityscapes", "hdf5", "image_paths", "covla", or "nuplan"
-        data_path: Path to Cityscapes root (if cityscapes) or ignored otherwise
+        data_path: Path to Cityscapes root (if cityscapes)
         input_size: Image size (H, W)
         batch_size: Batch size
         num_workers: Number of workers
@@ -632,8 +574,8 @@ def create_dataloaders(
         hdf5_paths_file: Path to HDF5 paths file (required if hdf5)
         val_json: Path to validation JSON (required if hdf5)
         num_frames: Number of frames per sample (for hdf5/image_paths/covla/nuplan)
-        stored_data_frame_rate: Stored frame rate (5 for hdf5, 20 for covla, 10 for nuplan)
-        frame_rate: Target frame rate (for hdf5/covla/nuplan)
+        stored_data_frame_rate: Native FPS of source data (5 for hdf5, 20 for covla, 10 for nuplan)
+        frame_rate: Target frame rate
         image_paths: List of image file paths (required if image_paths)
         covla_videos_dir: Directory with CoVLA videos (required if covla)
         covla_captions_dir: Directory with CoVLA captions (optional if covla)
@@ -751,10 +693,7 @@ def train_epoch(
     Returns:
         Tuple of (averaged metrics dict, EpochStats with IO timing)
     """
-    # Initialize epoch stats for IO wait tracking
     epoch_stats = EpochStats(epoch_num=epoch)
-    
-    # All Phase 1 metrics to track
     metrics_sum = {
         "loss": 0.0,
         "l0": 0.0,
@@ -768,44 +707,37 @@ def train_epoch(
     # Per-metric valid counts (some metrics can be NaN from fp16 edge cases)
     valid_counts = {k: 0 for k in metrics_sum}
     num_batches = 0
-    
-    # Set GPU monitor phase
+
     if gpu_monitor is not None:
         gpu_monitor.set_phase(f"train_epoch_{epoch}")
-    
-    # Create iterator for IO wait timing
+
     data_iter = iter(dataloader)
-    
-    # Determine number of steps (use steps_per_epoch for IterableDatasets like WebLoader)
+    # Use steps_per_epoch for IterableDatasets like WebLoader that don't have __len__
     try:
         num_steps = len(dataloader)
     except TypeError:
-        # WebLoader and other IterableDatasets don't have __len__
         if steps_per_epoch is None:
             raise ValueError(
                 "steps_per_epoch is required for IterableDatasets (e.g., WebLoader) "
                 "that don't have __len__"
             )
         num_steps = steps_per_epoch
-    
-    pbar = tqdm(range(num_steps), desc=f"Epoch {epoch}/{total_epochs} [train]", 
+
+    pbar = tqdm(range(num_steps), desc=f"Epoch {epoch}/{total_epochs} [train]",
                 file=sys.stdout, mininterval=360.0)
-    
+
     for _ in pbar:
-        # Time IO wait (how long we wait for the next batch)
         io_start = time.perf_counter()
         try:
             batch = next(data_iter)
         except StopIteration:
             break
         io_wait = time.perf_counter() - io_start
-        
-        # Time compute (actual training step)
+
         compute_start = time.perf_counter()
         metrics = trainer.train_step(batch)
         compute_time = time.perf_counter() - compute_start
-        
-        # Record batch timing
+
         batch_size = batch.shape[0] if hasattr(batch, 'shape') else len(batch)
         epoch_stats.add_batch(
             io_wait=io_wait,
@@ -813,15 +745,14 @@ def train_epoch(
             batch_size=batch_size,
             loss=metrics.get('loss', 0.0),
         )
-        
-        # NaN-safe accumulation: skip NaN/Inf values to prevent poisoning
+
+        # NaN-safe accumulation: skip NaN/Inf values to prevent poisoning averages
         for k in metrics_sum.keys():
             if k in metrics and math.isfinite(metrics[k]):
                 metrics_sum[k] += metrics[k]
                 valid_counts[k] += 1
         num_batches += 1
-        
-        # Display key metrics in progress bar: loss, l0, dead%, io_wait%
+
         io_pct = (epoch_stats.io_wait_time / epoch_stats.total_time * 100) if epoch_stats.total_time > 0 else 0
         pbar.set_postfix({
             "loss": f"{metrics['loss']:.4f}",
@@ -829,12 +760,10 @@ def train_epoch(
             "dead%": f"{metrics['dead_pct']:.1f}",
             "io%": f"{io_pct:.1f}",
         })
-        
-        # Intra-epoch checkpoint
+
         if checkpoint_callback is not None and checkpoint_steps and num_batches in checkpoint_steps:
             checkpoint_callback(num_batches, num_steps)
-    
-    # Collect GPU stats for this epoch
+
     if gpu_monitor is not None:
         gpu_stats = gpu_monitor.get_phase_stats(f"train_epoch_{epoch}")
         if 'avg_util_pct' in gpu_stats:
@@ -842,13 +771,13 @@ def train_epoch(
         if 'peak_memory_gb' in gpu_stats:
             epoch_stats.gpu_memory_samples.append(gpu_stats['peak_memory_gb'] * 1e9)
         gpu_monitor.clear_phase()
-    
+
     # Average metrics using per-metric valid counts to handle NaN batches
     avg_metrics = {
         k: v / valid_counts[k] if valid_counts[k] > 0 else float('nan')
         for k, v in metrics_sum.items()
     }
-    
+
     return avg_metrics, epoch_stats
 
 
@@ -893,571 +822,168 @@ def eval_epoch(
     return avg_metrics
 
 
-def main(args: argparse.Namespace, unknown_args: Sequence[str] = ()):
-    """Main training function."""
 
-    # Set seed for reproducibility
+@dataclass
+class ExperimentPaths:
+    """Bundles path variables that flow through the training pipeline."""
+    output_dir: Path
+    cache_dir: Path
+    train_cache_dir: Path
+    val_cache_dir: Path
+    config_path: Path
+    exp_dir: Path
+    orbis_root: Path
+    barcode: str
+    timestamp: str
+
+    def create_directories(self) -> None:
+        """Create all experiment directories."""
+        for d in [self.output_dir, self.train_cache_dir, self.val_cache_dir]:
+            d.mkdir(parents=True, exist_ok=True)
+
+
+
+def _setup_experiment(
+    args: argparse.Namespace,
+    device: torch.device,
+) -> Tuple["ExperimentPaths", Optional[nn.Module], int, bool, str, torch.dtype]:
+    """Seed, device, path resolution, directory creation, model loading.
+
+    Returns:
+        Tuple of (paths, model, hidden_size, use_webdataset, base_data_source, cache_dtype)
+    """
     if args.seed > 0:
         seed_everything(args.seed)
 
-    device = torch.device(args.device)
-    logger.info(f"Using device: {device}")
-
-    # Setup paths
     exp_dir = Path(args.exp_dir)
     config_path = exp_dir / args.config
-    ckpt_path = exp_dir / args.ckpt
-    
-    # Orbis root is 2 levels up from scripts/ (sae/scripts/ -> orbis/)
     orbis_root = Path(__file__).resolve().parents[2]
-    
-    # Cache path: logs_sae/sae_cache/{dataset}/{model}/{layer}/
+
     cache_base = orbis_root / "logs_sae" / "sae_cache"
     cache_dir = cache_base / args.data_source / exp_dir.name / f"layer_{args.layer}"
-    
-    # Setup output directory with timestamp for unique runs
+
     from datetime import datetime
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    # Use provided run_name or generate barcode
+
     if args.run_name:
         barcode = args.run_name
     else:
         raise ValueError("run_name is required")
-    
+
     if args.output_dir is not None:
-        # User specified custom output directory
         output_dir = Path(args.output_dir)
     else:
-        # Default: logs_sae/runs/{dataset}/{model}/{layer}/{barcode}/
         runs_base = orbis_root / "logs_sae" / "runs"
         output_dir = runs_base / args.data_source / exp_dir.name / f"layer_{args.layer}" / barcode
-    
-    # Print barcode for SLURM script to capture
-    logger.info(f"[barcode] {barcode}")
-    
-    output_dir.mkdir(parents=True, exist_ok=True)
-    cache_dir.mkdir(parents=True, exist_ok=True)
 
+    exp = ExperimentPaths(
+        output_dir=output_dir,
+        cache_dir=cache_dir,
+        train_cache_dir=cache_dir / "train",
+        val_cache_dir=cache_dir / "val",
+        config_path=config_path,
+        exp_dir=exp_dir,
+        orbis_root=orbis_root,
+        barcode=barcode,
+        timestamp=timestamp,
+    )
+    exp.create_directories()
+
+    logger.info(f"[barcode] {barcode}")
     logger.info(f"Experiment directory: {exp_dir}")
     logger.info(f"Cache directory: {cache_dir}")
     logger.info(f"Output directory: {output_dir}")
 
-    # Get base data source (strip "-webdataset" suffix if present)
     base_data_source = get_base_data_source(args.data_source)
     use_webdataset = is_webdataset_mode(args.data_source)
-    
-    # Determine if we need to load the Orbis model
-    # Model is ONLY needed for extracting activations via prepare_activation_cache()
-    # Skip loading if:
-    #   - WebDataset mode: activations already in shards
-    #   - --train_only: user asserts cache exists, skip caching phase
+
     skip_model_load = use_webdataset or args.train_only
-    
+
     if skip_model_load:
-        # Activations are pre-cached, don't need the model
         model = None
         hidden_size = 768  # Standard hidden size for Orbis/ViT-Base
         reason = "WebDataset mode" if use_webdataset else "--train_only flag"
         logger.info(f"Skipping model load ({reason}) - using hidden_size={hidden_size}")
     else:
-        # Need to potentially extract activations, load the model
+        ckpt_path = exp_dir / args.ckpt
         model = load_orbis_model(str(config_path), str(ckpt_path), device)
-        # Get hidden dimension from model
         hidden_size = model.vit.blocks[0].norm1.normalized_shape[0]
         logger.info(f"ST-Transformer hidden size: {hidden_size}")
 
-    # Cache directories
-    train_cache_dir = cache_dir / "train"
-    val_cache_dir = cache_dir / "val"
     cache_dtype = resolve_cache_dtype(args.cache_dtype)
-    
-    # ========================================================================
-    # ZERO-COST RESUME FLOW for CoVLA and NuPlan
-    # For these sources, we:
-    # 1. Create datasets first (not dataloaders)
-    # 2. Check cache status to determine resume point
-    # 3. Create dataloaders with Subset for remaining samples
-    # 4. Cache only the remaining activations
-    # ========================================================================
-    
-    logger.info(f"Loading data from {args.data_source} source")
-    if use_webdataset:
-        logger.info(f"  Base source: {base_data_source}")
-        logger.info(f"  Format: WebDataset shards (optimized for NFS)")
-    
-    if base_data_source in ("covla", "nuplan") and not use_webdataset:
-        # === Step 1: Create datasets (not dataloaders) ===
-        # Note: For WebDataset mode, we skip caching as shards already exist
-        if base_data_source == "covla":
-            if args.covla_videos_dir is None:
-                raise ValueError("covla_videos_dir required for CoVLA data source")
-            train_dataset, val_dataset = create_datasets_covla(
-                videos_dir=args.covla_videos_dir,
-                captions_dir=args.covla_captions_dir,
-                input_size=tuple(args.input_size),
-                num_frames=args.num_frames,
-                stored_data_frame_rate=args.stored_frame_rate,
-                frame_rate=args.frame_rate,
-                num_videos=args.num_videos,
-            )
-        else:  # nuplan
-            if args.nuplan_data_dir is None:
-                raise ValueError("nuplan_data_dir required for NuPlan data source")
-            train_dataset, val_dataset = create_datasets_nuplan(
-                data_dir=args.nuplan_data_dir,
-                input_size=tuple(args.input_size),
-                num_frames=args.num_frames,
-                stored_data_frame_rate=args.stored_frame_rate,
-                frame_rate=args.frame_rate,
-                num_videos=args.num_videos,
-            )
-        
-        # === Step 2: Check cache status for zero-cost resume ===
-        logger.info("Checking train cache status...")
-        train_resume = get_cache_resume_info(
-            cache_dir=train_cache_dir,
-            batch_size=args.batch_size,
-            total_samples=len(train_dataset),
-            rebuild=args.rebuild_cache,
-        )
-        
-        logger.info("Checking validation cache status...")
-        val_resume = get_cache_resume_info(
-            cache_dir=val_cache_dir,
-            batch_size=args.batch_size,
-            total_samples=len(val_dataset),
-            rebuild=args.rebuild_cache,
-        )
-        
-        # === Step 3: Create dataloaders with Subset for remaining samples ===
-        train_loader = create_dataloader_with_offset(
-            dataset=train_dataset,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-            device=device,
-            start_sample_idx=train_resume.start_sample_idx,
-        )
-        
-        val_loader = create_dataloader_with_offset(
-            dataset=val_dataset,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-            device=device,
-            start_sample_idx=val_resume.start_sample_idx,
-        )
-        
-        # === Step 4: Cache activations (zero-cost resume) ===
-        # Skip caching if --train_only is set (assumes cache exists)
-        if args.train_only:
-            logger.info("--train_only: Skipping caching, assuming cache exists")
-            train_cache_files = train_resume.valid_files
-            val_cache_files = val_resume.valid_files
-            if not train_resume.is_complete or not val_resume.is_complete:
-                raise RuntimeError(
-                    "--train_only specified but cache is incomplete. "
-                    "Run caching first or remove --train_only flag."
-                )
-        else:
-            # Determine data_dir for metadata
-            data_dir = args.covla_videos_dir if base_data_source == "covla" else args.nuplan_data_dir
-            
-            try:
-                if not train_resume.is_complete:
-                    logger.info("Caching train activations...")
-                    train_cache_files = prepare_activation_cache(
-                        model=model,
-                        dataloader=train_loader,
-                        cache_dir=train_cache_dir,
-                        layer_idx=args.layer,
-                        device=device,
-                        dtype=cache_dtype,
-                        dtype_name=args.cache_dtype,
-                        t_noise=args.t_noise,
-                        frame_rate=args.frame_rate,
-                        start_batch_idx=train_resume.start_batch_idx,
-                        existing_tokens=train_resume.total_tokens,
-                        existing_files=train_resume.valid_files,
-                        existing_hidden_dim=train_resume.hidden_dim,
-                        # Reproducibility metadata
-                        seed=args.cache_seed,
-                        orbis_exp_dir=str(exp_dir),
-                        data_source=args.data_source,
-                        data_dir=data_dir,
-                        num_videos=args.num_videos,
-                        num_frames=args.num_frames,
-                        val_split=0.1,  # Hardcoded in create_datasets_*
-                        input_size=tuple(args.input_size),
-                        stored_frame_rate=args.stored_frame_rate,
-                    )
-                else:
-                    logger.info("Train cache complete, skipping...")
-                    train_cache_files = train_resume.valid_files
-                
-                if not val_resume.is_complete:
-                    logger.info("Caching validation activations...")
-                    val_cache_files = prepare_activation_cache(
-                        model=model,
-                        dataloader=val_loader,
-                        cache_dir=val_cache_dir,
-                        layer_idx=args.layer,
-                        device=device,
-                        dtype=cache_dtype,
-                        dtype_name=args.cache_dtype,
-                        t_noise=args.t_noise,
-                        frame_rate=args.frame_rate,
-                        start_batch_idx=val_resume.start_batch_idx,
-                        existing_tokens=val_resume.total_tokens,
-                        existing_files=val_resume.valid_files,
-                        existing_hidden_dim=val_resume.hidden_dim,
-                        # Reproducibility metadata
-                        seed=args.cache_seed,
-                        orbis_exp_dir=str(exp_dir),
-                        data_source=args.data_source,
-                        data_dir=data_dir,
-                        num_videos=args.num_videos,
-                        num_frames=args.num_frames,
-                        val_split=0.1,
-                        input_size=tuple(args.input_size),
-                        stored_frame_rate=args.stored_frame_rate,
-                    )
-                else:
-                    logger.info("Validation cache complete, skipping...")
-                    val_cache_files = val_resume.valid_files
-                
-                # Exit after caching if --cache_only is set
-                if args.cache_only:
-                    logger.info("--cache_only: Caching complete, exiting")
-                    sys.exit(0)
-                    
-            except Exception as e:
-                logger.error(f"Caching FAILED: {e}")
-                sys.exit(1)  # Non-zero exit for SLURM afterok dependency
-    
-    elif use_webdataset:
-        # === WEBDATASET FLOW: Skip caching, shards already exist ===
-        logger.info("WebDataset mode: Skipping caching (shards already exist)")
-        # train_cache_files and val_cache_files are not needed for WebDataset
-        # They will be replaced by WebDataset loaders below
-        pass
-    
-    else:
-        # === LEGACY FLOW for other data sources (cityscapes, hdf5, image_paths) ===
-        # These don't benefit from zero-cost resume as much, use simple flow
-        train_loader, val_loader = create_dataloaders(
-            data_source=args.data_source,
-            data_path=args.data_path,
-            input_size=tuple(args.input_size),
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-            device=device,
-            hdf5_paths_file=args.hdf5_paths_file,
-            val_json=args.val_json,
-            num_frames=args.num_frames,
-            stored_data_frame_rate=args.stored_frame_rate,
-            frame_rate=args.frame_rate,
-            image_paths=args.image_paths,
-            covla_videos_dir=args.covla_videos_dir,
-            covla_captions_dir=args.covla_captions_dir,
-            nuplan_data_dir=args.nuplan_data_dir,
-            num_videos=args.num_videos,
-        )
-        
-        # Check cache for these sources (simpler flow without zero-cost resume)
-        train_resume = get_cache_resume_info(
-            cache_dir=train_cache_dir,
-            batch_size=args.batch_size,
-            total_samples=len(train_loader.dataset),
-            rebuild=args.rebuild_cache,
-        )
-        val_resume = get_cache_resume_info(
-            cache_dir=val_cache_dir,
-            batch_size=args.batch_size,
-            total_samples=len(val_loader.dataset),
-            rebuild=args.rebuild_cache,
-        )
-        
-        # Skip caching if --train_only is set (assumes cache exists)
-        if args.train_only:
-            logger.info("--train_only: Skipping caching, assuming cache exists")
-            train_cache_files = train_resume.valid_files
-            val_cache_files = val_resume.valid_files
-            if not train_resume.is_complete or not val_resume.is_complete:
-                raise RuntimeError(
-                    "--train_only specified but cache is incomplete. "
-                    "Run caching first or remove --train_only flag."
-                )
-        else:
-            try:
-                # Cache activations (will skip batches via continue if resuming)
-                if not train_resume.is_complete:
-                    logger.info("Caching train activations...")
-                    train_cache_files = prepare_activation_cache(
-                        model=model,
-                        dataloader=train_loader,
-                        cache_dir=train_cache_dir,
-                        layer_idx=args.layer,
-                        device=device,
-                        dtype=cache_dtype,
-                        dtype_name=args.cache_dtype,
-                        t_noise=args.t_noise,
-                        frame_rate=args.frame_rate,
-                        start_batch_idx=0,  # Full dataloader, start from 0
-                        existing_tokens=0,
-                        existing_files=[],
-                        # Reproducibility metadata
-                        seed=args.cache_seed,
-                        orbis_exp_dir=str(exp_dir),
-                        data_source=args.data_source,
-                        data_dir=args.data_path,
-                        num_frames=args.num_frames,
-                        input_size=tuple(args.input_size),
-                        stored_frame_rate=args.stored_frame_rate,
-                    )
-                else:
-                    train_cache_files = train_resume.valid_files
-                
-                if not val_resume.is_complete:
-                    logger.info("Caching validation activations...")
-                    val_cache_files = prepare_activation_cache(
-                        model=model,
-                        dataloader=val_loader,
-                        cache_dir=val_cache_dir,
-                        layer_idx=args.layer,
-                        device=device,
-                        dtype=cache_dtype,
-                        dtype_name=args.cache_dtype,
-                        t_noise=args.t_noise,
-                        frame_rate=args.frame_rate,
-                        start_batch_idx=0,
-                        existing_tokens=0,
-                        existing_files=[],
-                        # Reproducibility metadata
-                        seed=args.cache_seed,
-                        orbis_exp_dir=str(exp_dir),
-                        data_source=args.data_source,
-                        data_dir=args.data_path,
-                        num_frames=args.num_frames,
-                        input_size=tuple(args.input_size),
-                        stored_frame_rate=args.stored_frame_rate,
-                    )
-                else:
-                    val_cache_files = val_resume.valid_files
-                
-                # Exit after caching if --cache_only is set
-                if args.cache_only:
-                    logger.info("--cache_only: Caching complete, exiting")
-                    sys.exit(0)
-                    
-            except Exception as e:
-                logger.error(f"Caching FAILED: {e}")
-                sys.exit(1)  # Non-zero exit for SLURM afterok dependency
+    return exp, model, hidden_size, use_webdataset, base_data_source, cache_dtype
 
-    # Create activation dataloaders for SAE training
-    # Resolve SAE batch size (handles "auto" by reading from calibration resource)
-    sae_batch_size = resolve_sae_batch_size(
-        batch_size_arg=args.sae_batch_size,
-        layer=args.layer,
-        expansion=args.expansion_factor,
-        k=args.k,
-    )
-    logger.info(f"SAE batch size: {sae_batch_size:,} tokens")
-    
-    if use_webdataset:
-        # === WebDataset mode: Stream from sharded tar archives ===
-        # This is much faster on NFS due to sequential I/O
-        logger.info("Creating WebDataset dataloaders (optimized for NFS)...")
-        
-        # Shards are expected under <cache_dir>/train.
-        wds_dir = train_cache_dir
-        
-        if not wds_dir.exists():
-            raise FileNotFoundError(
-                f"WebDataset directory not found: {wds_dir}\n"
-                f"Run the conversion script first: python sae/scripts/convert_to_webdataset.py"
-            )
-        
-        # Count available shards (train)
-        available_shards = sorted(wds_dir.glob(f"layer_{args.layer}-train-*.tar"))
-        total_shards = len(available_shards)
-        if total_shards == 0:
-            raise FileNotFoundError(f"No shards found in {wds_dir}")
-        
-        num_shards = args.num_shards or total_shards
-        if num_shards > total_shards:
-            logger.warning(f"Requested {num_shards} shards but only {total_shards} available. Using all.")
-            num_shards = total_shards
-        
-        # Use an explicit list of shards (robust to missing indices)
-        train_shards = [str(p) for p in available_shards[:num_shards]]
-        
-        logger.info(f"WebDataset train directory: {wds_dir}")
-        logger.info(f"Using {len(train_shards)} train shards")
-        logger.info(f"Using {num_shards}/{total_shards} shards")
-        # Cached batch size from conversion (tokens per .pt file)
-        # Each file contains 4 clips × 6 frames × 576 spatial = 13824 correlated tokens
-        CACHED_BATCH_SIZE = 13824
-        
-        # Use large shuffle buffer for proper IID mixing
-        # Memory: shuffle_buffer × 768 × 4 bytes (e.g., 500k ≈ 1.5GB)
-        logger.info(f"Shuffle buffer: {args.shuffle_buffer:,} tokens")
-        
-        train_act_loader, train_meta = create_webdataset_dataloader(
-            shard_pattern=train_shards,
-            batch_size=sae_batch_size,
-            shuffle_buffer=args.shuffle_buffer,
-            num_workers=4,
-            seed=args.seed,
-            cached_batch_size=CACHED_BATCH_SIZE,
-        )
-        
-        # Validation (WebDataset shards under <cache_dir>/val, or legacy .pt files)
-        val_act_loader = None
-        val_meta: Dict[str, Any] = {"tokens_used": 0, "total_tokens": 0}
-        
-        if val_cache_dir.exists():
-            val_shards = sorted(val_cache_dir.glob(f"layer_{args.layer}-val-*.tar"))
-            if len(val_shards) > 0:
-                logger.info(f"Using WebDataset shards for validation: {val_cache_dir} ({len(val_shards)} shards)")
-                val_act_loader, val_meta = create_webdataset_dataloader(
-                    shard_pattern=[str(p) for p in val_shards],
-                    batch_size=sae_batch_size,
-                    shuffle_buffer=0,  # no shuffle for validation
-                    num_workers=0,
-                    seed=args.seed,
-                    cached_batch_size=CACHED_BATCH_SIZE,
-                )
-                # Try to read val meta if present (optional)
-                meta_path = val_cache_dir / "_meta.json"
-                if meta_path.exists():
-                    try:
-                        with open(meta_path, "r") as f:
-                            meta_json = json.load(f)
-                        if isinstance(meta_json, dict) and "total_tokens" in meta_json:
-                            val_meta["tokens_used"] = int(meta_json["total_tokens"])
-                            val_meta["total_tokens"] = int(meta_json["total_tokens"])
-                    except Exception:
-                        # Best-effort only
-                        pass
-            elif list(val_cache_dir.glob("batch_*.pt")):
-                logger.info("Using individual .pt files for validation (cache exists)")
-                val_act_loader, val_meta = create_activation_dataloader(
-                    val_cache_dir,
-                    batch_size=sae_batch_size,
-                    shuffle=False,
-                    num_workers=0,
-                    in_memory=True,
-                    max_tokens=args.max_tokens,
-                )
-        
-        if val_act_loader is None:
-            logger.warning("No validation cache found. Validation will be limited.")
-        
-        # Populate hidden_dim for byte calculation in cache stats
-        val_meta["hidden_dim"] = hidden_size
-        
-        # Estimate tokens for WebDataset (approximate)
-        estimated_batches_per_shard = 471
-        estimated_tokens = num_shards * estimated_batches_per_shard * CACHED_BATCH_SIZE
-        train_meta["tokens_used"] = estimated_tokens
-        train_meta["total_tokens"] = estimated_tokens  # For config.json compatibility
-        train_meta["estimated"] = True
-        train_meta["hidden_dim"] = hidden_size
-        train_meta["num_files"] = len(train_shards)
-        
-    else:
-        # === Standard mode: Load from individual .pt files ===
-        in_memory = not args.streaming
-        logger.info(f"Creating activation dataloaders (streaming={args.streaming})...")
-        
-        train_act_loader, train_meta = create_activation_dataloader(
-            train_cache_dir,
-            batch_size=sae_batch_size,
-            shuffle=True,
-            num_workers=4 if args.streaming else 0,
-            in_memory=in_memory,
-            max_tokens=args.max_tokens,
-        )
 
-        val_act_loader, val_meta = create_activation_dataloader(
-            val_cache_dir,
-            batch_size=sae_batch_size,
-            shuffle=False,
-            num_workers=4 if args.streaming else 0,
-            in_memory=in_memory,
-            max_tokens=args.max_tokens,
-        )
-
-    logger.info(f"SAE batch size: {sae_batch_size:,} tokens")
-    logger.info(f"Train tokens: {train_meta['tokens_used']:,}" + (" (estimated)" if train_meta.get("estimated") else ""))
-    logger.info(f"Val tokens: {val_meta['tokens_used']:,}")
-
-    # Calculate steps per epoch (needed for WebDataset which doesn't have __len__)
-    # For standard dataloaders, len(dataloader) works; for WebLoader we need this
-    steps_per_epoch = train_meta['tokens_used'] // sae_batch_size
-    logger.info(f"Steps per epoch: {steps_per_epoch:,}")
-
-    # Create SAE
+def _create_sae_and_trainer(
+    args: argparse.Namespace,
+    hidden_size: int,
+    device: torch.device,
+) -> Tuple[TopKSAE, TopKSAETrainer, TopKSAEConfig]:
+    """Instantiate SAE model and trainer."""
     sae_config = TopKSAEConfig(
         d_in=hidden_size,
         expansion_factor=args.expansion_factor,
         k=args.k,
     )
-
     sae = TopKSAE(sae_config)
     logger.info(f"Created SAE: {sae}")
 
-    # Create trainer with optional optimizations
     trainer = TopKSAETrainer(
         model=sae,
         lr=args.lr,
         weight_decay=args.weight_decay,
         device=device,
         compile_model=args.compile,
+        max_grad_norm=args.max_grad_norm,
     )
-    
     logger.info("Accelerate fp16 mixed precision enabled")
     if args.compile:
         logger.info("torch.compile enabled")
 
-    # Save comprehensive config for reproducibility
-    # Get git commit hash if available
+    return sae, trainer, sae_config
+
+
+def _save_experiment_config(
+    args: argparse.Namespace,
+    exp: ExperimentPaths,
+    sae_config: TopKSAEConfig,
+    train_meta: Dict[str, Any],
+    val_meta: Dict[str, Any],
+) -> None:
+    """Serialize all config to JSON for reproducibility."""
     git_commit = None
     try:
         import subprocess
         git_commit = subprocess.check_output(
             ["git", "rev-parse", "HEAD"],
-            cwd=orbis_root,
-            stderr=subprocess.DEVNULL
+            cwd=exp.orbis_root,
+            stderr=subprocess.DEVNULL,
         ).decode("utf-8").strip()
     except Exception:
         pass
-    
+
     config_save = {
-        # SAE architecture
         "sae_config": {
             "d_in": sae_config.d_in,
             "d_sae": sae_config.d_sae,
             "expansion_factor": sae_config.expansion_factor,
             "k": sae_config.k,
         },
-        # Training hyperparameters
         "training": {
             "lr": args.lr,
             "weight_decay": args.weight_decay,
+            "max_grad_norm": args.max_grad_norm,
             "num_epochs": args.num_epochs,
             "batch_size": args.batch_size,
             "eval_every": args.eval_every,
             "save_every": args.save_every,
             "seed": args.seed,
         },
-        # Activation extraction settings
         "activation": {
             "layer_idx": args.layer,
             "t_noise": args.t_noise,
             "frame_rate": args.frame_rate,
         },
-        # Data configuration
         "data": {
             "data_source": args.data_source,
             "input_size": args.input_size,
@@ -1465,7 +991,6 @@ def main(args: argparse.Namespace, unknown_args: Sequence[str] = ()):
             "stored_frame_rate": args.stored_frame_rate,
             "num_videos": args.num_videos,
             "num_workers": args.num_workers,
-            # Source-specific paths (only include relevant ones)
             "data_path": args.data_path,
             "hdf5_paths_file": args.hdf5_paths_file,
             "val_json": args.val_json,
@@ -1474,70 +999,59 @@ def main(args: argparse.Namespace, unknown_args: Sequence[str] = ()):
             "nuplan_data_dir": args.nuplan_data_dir,
             "image_paths": args.image_paths,
         },
-        # Cache settings
         "cache": {
-            "cache_dir": str(cache_dir),
+            "cache_dir": str(exp.cache_dir),
             "cache_dtype": args.cache_dtype,
             "streaming": args.streaming,
         },
-        # Orbis model
         "orbis": {
-            "exp_dir": str(exp_dir),
+            "exp_dir": str(exp.exp_dir),
             "ckpt": args.ckpt,
             "config": args.config,
         },
-        # Output paths
         "output": {
-            "output_dir": str(output_dir),
-            "run_name": barcode,
+            "output_dir": str(exp.output_dir),
+            "run_name": exp.barcode,
         },
-        # Metadata for reproducibility
         "metadata": {
             "git_commit": git_commit,
             "device": args.device,
-            "timestamp": timestamp,
+            "timestamp": exp.timestamp,
             "train_tokens": train_meta["total_tokens"],
             "val_tokens": val_meta["total_tokens"],
         },
     }
 
-    with open(output_dir / "config.json", "w") as f:
+    with open(exp.output_dir / "config.json", "w") as f:
         json.dump(config_save, f, indent=2)
-    
-    logger.info(f"Saved full config to {output_dir / 'config.json'}")
+    logger.info(f"Saved full config to {exp.output_dir / 'config.json'}")
 
-    # Initialize timing stats
-    stats.set_run_info(run_name=barcode, layer=args.layer, data_source=args.data_source)
-    
-    # Determine data source type based on cache location
-    cache_path_str = str(cache_dir)
-    if "/tmp" in cache_path_str or "/scratch" in cache_path_str:
-        data_source_type = "tmpdir"
-    elif "/data/lmb" in cache_path_str:
-        data_source_type = "NVMe_SSD"
-    else:
-        data_source_type = "NFS"
-    stats.set_data_source(source_type=data_source_type, path=cache_path_str)
-    
-    # Start GPU monitoring
-    gpu_monitor = GPUMonitor(sample_interval_s=2.0, device_id=0 if torch.cuda.is_available() else -1)
-    if torch.cuda.is_available():
-        gpu_monitor.start()
-    
-    # Training loop
+
+def _run_training_loop(
+    args: argparse.Namespace,
+    sae: TopKSAE,
+    trainer: TopKSAETrainer,
+    train_act_loader,
+    val_act_loader: Optional[DataLoader],
+    exp: "ExperimentPaths",
+    use_webdataset: bool,
+    steps_per_epoch: int,
+    gpu_monitor: GPUMonitor,
+) -> Tuple[list, float, float]:
+    """Epoch loop with checkpointing, validation, and intra-epoch saves."""
     logger.info(f"Starting training for {args.num_epochs} epochs...")
     training_start = time.perf_counter()
     best_val_loss = float("inf")
-    history = []
+    history: list = []
 
     # Automatic intra-epoch checkpointing when epochs are few and long
     intra_ckpt_steps: Optional[set] = None
     intra_ckpt_callback: Optional[Callable[[int, int], None]] = None
     if args.num_epochs < 3 and steps_per_epoch > 0:
-        num_fractions = 4  # Checkpoint every 25%
+        num_fractions = 4
         intra_ckpt_steps = {
             int(steps_per_epoch * (i + 1) / num_fractions)
-            for i in range(num_fractions - 1)  # Exclude 100% (handled by epoch end)
+            for i in range(num_fractions - 1)
         }
         logger.info(
             f"Intra-epoch checkpointing enabled (num_epochs={args.num_epochs} < 3): "
@@ -1571,106 +1085,488 @@ def main(args: argparse.Namespace, unknown_args: Sequence[str] = ()):
             return callback
 
         intra_ckpt_callback = _make_checkpoint_callback(
-            sae, trainer, val_act_loader, output_dir, logger,
+            sae, trainer, val_act_loader, exp.output_dir, logger,
         )
 
     for epoch in range(1, args.num_epochs + 1):
-        # Train with IO wait tracking
-        train_metrics, epoch_stats = train_epoch(
+        train_metrics, epoch_stats_rec = train_epoch(
             trainer, train_act_loader, epoch, args.num_epochs, gpu_monitor,
             steps_per_epoch=steps_per_epoch if use_webdataset else None,
             checkpoint_callback=intra_ckpt_callback,
             checkpoint_steps=intra_ckpt_steps,
         )
-        
-        # Record epoch stats for summary
-        stats.record_epoch(epoch_stats)
+        stats.record_epoch(epoch_stats_rec)
 
-        # Evaluate
         if epoch % args.eval_every == 0 or epoch == args.num_epochs:
-            # Run validation if we have a validation loader
             if val_act_loader is not None:
                 val_metrics = eval_epoch(trainer, val_act_loader)
             else:
                 val_metrics = None
 
-            logger.info(f"Epoch {epoch}/{args.num_epochs}:")
-            logger.info(f"  Train - loss: {train_metrics['loss']:.4f}, l0: {train_metrics['l0']:.1f}, "
-                        f"R²: {train_metrics['explained_variance']:.4f}, cos_sim: {train_metrics['cos_sim']:.4f}")
-            logger.info(f"          rel_err: {train_metrics['rel_error']:.4f}, L1: {train_metrics['l1_norm']:.2f}, "
-                        f"dead%: {train_metrics['dead_pct']:.1f}")
-            logger.info(f"          io_wait: {epoch_stats.io_wait_pct:.1f}%, efficiency: {epoch_stats.efficiency_index:.2f}")
-            
+            logger.info(
+                f"Epoch {epoch}/{args.num_epochs} Train: "
+                f"loss={train_metrics['loss']:.4f} l0={train_metrics['l0']:.1f} "
+                f"R\u00b2={train_metrics['explained_variance']:.4f} cos={train_metrics['cos_sim']:.4f} "
+                f"dead%={train_metrics['dead_pct']:.1f} io%={epoch_stats_rec.io_wait_pct:.1f}"
+            )
             if val_metrics is not None:
-                logger.info(f"  Val   - loss: {val_metrics['loss']:.4f}, l0: {val_metrics['l0']:.1f}, "
-                            f"R²: {val_metrics['explained_variance']:.4f}, cos_sim: {val_metrics['cos_sim']:.4f}")
-                logger.info(f"          rel_err: {val_metrics['rel_error']:.4f}, L1: {val_metrics['l1_norm']:.2f}")
+                logger.info(
+                    f"  Val: loss={val_metrics['loss']:.4f} l0={val_metrics['l0']:.1f} "
+                    f"R\u00b2={val_metrics['explained_variance']:.4f} cos={val_metrics['cos_sim']:.4f}"
+                )
 
-            # Save best model (use train loss if no validation)
             compare_loss = val_metrics['loss'] if val_metrics else train_metrics['loss']
             if compare_loss < best_val_loss:
                 best_val_loss = compare_loss
-                sae.save(str(output_dir / "best_sae.pt"))
+                sae.save(str(exp.output_dir / "best_sae.pt"))
                 logger.info("  -> New best model saved!")
         else:
             val_metrics = None
-            logger.info(f"Epoch {epoch}/{args.num_epochs}: train_loss={train_metrics['loss']:.4f}, "
-                        f"l0={train_metrics['l0']:.1f}, dead%={train_metrics['dead_pct']:.1f}, "
-                        f"io_wait%={epoch_stats.io_wait_pct:.1f}")
 
-        # Record history
-        history.append({
-            "epoch": epoch,
-            "train": train_metrics,
-            "val": val_metrics,
-        })
-
-        # Save checkpoint periodically
+        history.append({"epoch": epoch, "train": train_metrics, "val": val_metrics})
         if epoch % args.save_every == 0:
-            sae.save(str(output_dir / f"sae_epoch_{epoch:03d}.pt"))
+            sae.save(str(exp.output_dir / f"sae_epoch_{epoch:03d}.pt"))
 
-    # Save final model and history
-    sae.save(str(output_dir / "final_sae.pt"))
+    return history, best_val_loss, training_start
 
-    with open(output_dir / "history.json", "w") as f:
+
+def _finalize_training(
+    args: argparse.Namespace,
+    exp: "ExperimentPaths",
+    sae: TopKSAE,
+    history: list,
+    best_val_loss: float,
+    training_start: float,
+    train_meta: Dict[str, Any],
+    val_meta: Dict[str, Any],
+    gpu_monitor: GPUMonitor,
+    steps_per_epoch: int,
+) -> None:
+    """Save final model, collect stats, print summary."""
+    sae.save(str(exp.output_dir / "final_sae.pt"))
+
+    with open(exp.output_dir / "history.json", "w") as f:
         json.dump(history, f, indent=2)
 
-    # Stop GPU monitor and collect final stats (includes RAM)
     if torch.cuda.is_available():
         gpu_monitor.stop()
         monitor_stats = gpu_monitor.get_stats()
         stats.set_gpu_stats(monitor_stats)
-        # Extract RAM stats from the combined monitor output
         ram_keys = ("job_ram_peak_gb", "main_process_ram_peak_gb", "system_ram_peak_gb", "system_ram_total_gb")
         stats.set_ram_stats({k: monitor_stats[k] for k in ram_keys if k in monitor_stats})
-    
-    # Record training stats
+
     training_time = time.perf_counter() - training_start
     stats.set_training_stats(
         num_epochs=args.num_epochs,
         batches_per_epoch=steps_per_epoch,
         final_loss=best_val_loss,
     )
-    
-    # Record cache stats
+
     stats.set_cache_stats(
         train_batches=len(train_meta.get('files', [])) if isinstance(train_meta.get('files'), list) else train_meta.get('num_files', 0),
         train_tokens=train_meta['tokens_used'],
-        train_bytes=train_meta.get('total_tokens', 0) * train_meta.get('hidden_dim', 0) * 2,  # Approximate
+        train_bytes=train_meta.get('total_tokens', 0) * train_meta.get('hidden_dim', 0) * BYTES_PER_FLOAT16,
         val_batches=len(val_meta.get('files', [])) if isinstance(val_meta.get('files'), list) else val_meta.get('num_files', 0),
         val_tokens=val_meta['tokens_used'],
-        val_bytes=val_meta.get('total_tokens', 0) * val_meta.get('hidden_dim', 0) * 2,
+        val_bytes=val_meta.get('total_tokens', 0) * val_meta.get('hidden_dim', 0) * BYTES_PER_FLOAT16,
         dtype=args.cache_dtype,
     )
-    
-    # Print summary and save timing stats
+
     stats.print_summary()
-    stats.save_json(output_dir / "timing_stats.json")
+    stats.save_json(exp.output_dir / "timing_stats.json")
 
     logger.info("Training complete!")
     logger.info(f"  Best val loss: {best_val_loss:.4f}")
     logger.info(f"  Training time: {format_duration(training_time)}")
-    logger.info(f"  Outputs saved to: {output_dir}")
+    logger.info(f"  Outputs saved to: {exp.output_dir}")
+
+
+def _cache_with_resume(
+    args: argparse.Namespace,
+    model: nn.Module,
+    exp: "ExperimentPaths",
+    base_data_source: str,
+    cache_dtype: torch.dtype,
+    device: torch.device,
+) -> Tuple[List[Path], List[Path]]:
+    """Cache activations for covla/nuplan with zero-cost resume via Subset."""
+    if base_data_source == "covla":
+        if args.covla_videos_dir is None:
+            raise ValueError("covla_videos_dir required for CoVLA data source")
+        train_dataset, val_dataset = create_datasets_covla(
+            videos_dir=args.covla_videos_dir,
+            captions_dir=args.covla_captions_dir,
+            input_size=tuple(args.input_size),
+            num_frames=args.num_frames,
+            stored_data_frame_rate=args.stored_frame_rate,
+            frame_rate=args.frame_rate,
+            num_videos=args.num_videos,
+        )
+    else:
+        if args.nuplan_data_dir is None:
+            raise ValueError("nuplan_data_dir required for NuPlan data source")
+        train_dataset, val_dataset = create_datasets_nuplan(
+            data_dir=args.nuplan_data_dir,
+            input_size=tuple(args.input_size),
+            num_frames=args.num_frames,
+            stored_data_frame_rate=args.stored_frame_rate,
+            frame_rate=args.frame_rate,
+            num_videos=args.num_videos,
+        )
+
+    train_resume = get_cache_resume_info(
+        cache_dir=exp.train_cache_dir, batch_size=args.batch_size,
+        total_samples=len(train_dataset), rebuild=args.rebuild_cache,
+    )
+    val_resume = get_cache_resume_info(
+        cache_dir=exp.val_cache_dir, batch_size=args.batch_size,
+        total_samples=len(val_dataset), rebuild=args.rebuild_cache,
+    )
+
+    train_loader = create_dataloader_with_offset(
+        dataset=train_dataset, batch_size=args.batch_size,
+        num_workers=args.num_workers, device=device,
+        start_sample_idx=train_resume.start_sample_idx,
+    )
+    val_loader = create_dataloader_with_offset(
+        dataset=val_dataset, batch_size=args.batch_size,
+        num_workers=args.num_workers, device=device,
+        start_sample_idx=val_resume.start_sample_idx,
+    )
+
+    if args.train_only:
+        if not train_resume.is_complete or not val_resume.is_complete:
+            raise RuntimeError(
+                "--train_only specified but cache is incomplete. "
+                "Run caching first or remove --train_only flag."
+            )
+        return train_resume.valid_files, val_resume.valid_files
+
+    data_dir = args.covla_videos_dir if base_data_source == "covla" else args.nuplan_data_dir
+    cache_config = CacheConfig(
+        layer_idx=args.layer, dtype=cache_dtype, dtype_name=args.cache_dtype,
+        t_noise=args.t_noise, frame_rate=args.frame_rate,
+        seed=args.cache_seed, orbis_exp_dir=str(exp.exp_dir),
+        data_source=args.data_source, data_dir=data_dir,
+        num_videos=args.num_videos, num_frames=args.num_frames,
+        val_split=0.1, input_size=tuple(args.input_size),
+        stored_frame_rate=args.stored_frame_rate,
+    )
+
+    try:
+        if not train_resume.is_complete:
+            logger.info("Caching train activations...")
+            train_files = prepare_activation_cache(
+                model=model, dataloader=train_loader, cache_dir=exp.train_cache_dir,
+                config=cache_config, resume=train_resume, device=device,
+            )
+        else:
+            train_files = train_resume.valid_files
+
+        if not val_resume.is_complete:
+            logger.info("Caching validation activations...")
+            val_files = prepare_activation_cache(
+                model=model, dataloader=val_loader, cache_dir=exp.val_cache_dir,
+                config=cache_config, resume=val_resume, device=device,
+            )
+        else:
+            val_files = val_resume.valid_files
+
+        if args.cache_only:
+            logger.info("--cache_only: Caching complete, exiting")
+            sys.exit(0)
+    except Exception as e:
+        logger.error(f"Caching FAILED: {e}")
+        sys.exit(1)
+
+    return train_files, val_files
+
+
+def _cache_simple(
+    args: argparse.Namespace,
+    model: nn.Module,
+    exp: "ExperimentPaths",
+    cache_dtype: torch.dtype,
+    device: torch.device,
+) -> Tuple[List[Path], List[Path]]:
+    """Cache activations for legacy sources (cityscapes, hdf5, image_paths)."""
+    train_loader, val_loader = create_dataloaders(
+        data_source=args.data_source, data_path=args.data_path,
+        input_size=tuple(args.input_size), batch_size=args.batch_size,
+        num_workers=args.num_workers, device=device,
+        hdf5_paths_file=args.hdf5_paths_file, val_json=args.val_json,
+        num_frames=args.num_frames, stored_data_frame_rate=args.stored_frame_rate,
+        frame_rate=args.frame_rate, image_paths=args.image_paths,
+        covla_videos_dir=args.covla_videos_dir,
+        covla_captions_dir=args.covla_captions_dir,
+        nuplan_data_dir=args.nuplan_data_dir,
+        num_videos=args.num_videos,
+    )
+
+    train_resume = get_cache_resume_info(
+        cache_dir=exp.train_cache_dir, batch_size=args.batch_size,
+        total_samples=len(train_loader.dataset), rebuild=args.rebuild_cache,
+    )
+    val_resume = get_cache_resume_info(
+        cache_dir=exp.val_cache_dir, batch_size=args.batch_size,
+        total_samples=len(val_loader.dataset), rebuild=args.rebuild_cache,
+    )
+
+    if args.train_only:
+        if not train_resume.is_complete or not val_resume.is_complete:
+            raise RuntimeError(
+                "--train_only specified but cache is incomplete. "
+                "Run caching first or remove --train_only flag."
+            )
+        return train_resume.valid_files, val_resume.valid_files
+
+    cache_config = CacheConfig(
+        layer_idx=args.layer, dtype=cache_dtype, dtype_name=args.cache_dtype,
+        t_noise=args.t_noise, frame_rate=args.frame_rate,
+        seed=args.cache_seed, orbis_exp_dir=str(exp.exp_dir),
+        data_source=args.data_source, data_dir=args.data_path,
+        num_frames=args.num_frames, input_size=tuple(args.input_size),
+        stored_frame_rate=args.stored_frame_rate,
+    )
+
+    try:
+        if not train_resume.is_complete:
+            logger.info("Caching train activations...")
+            train_files = prepare_activation_cache(
+                model=model, dataloader=train_loader, cache_dir=exp.train_cache_dir,
+                config=cache_config, resume=CacheResumeInfo.fresh(), device=device,
+            )
+        else:
+            train_files = train_resume.valid_files
+
+        if not val_resume.is_complete:
+            logger.info("Caching validation activations...")
+            val_files = prepare_activation_cache(
+                model=model, dataloader=val_loader, cache_dir=exp.val_cache_dir,
+                config=cache_config, resume=CacheResumeInfo.fresh(), device=device,
+            )
+        else:
+            val_files = val_resume.valid_files
+
+        if args.cache_only:
+            logger.info("--cache_only: Caching complete, exiting")
+            sys.exit(0)
+    except Exception as e:
+        logger.error(f"Caching FAILED: {e}")
+        sys.exit(1)
+
+    return train_files, val_files
+
+
+def _prepare_and_cache_activations(
+    args: argparse.Namespace,
+    model: Optional[nn.Module],
+    exp: "ExperimentPaths",
+    base_data_source: str,
+    use_webdataset: bool,
+    cache_dtype: torch.dtype,
+    device: torch.device,
+) -> Tuple[Optional[List[Path]], Optional[List[Path]]]:
+    """Dispatch data loading and activation caching to the appropriate flow.
+
+    Returns (train_cache_files, val_cache_files), or (None, None) for WebDataset.
+    """
+    logger.info(f"Loading data from {args.data_source} source")
+
+    if use_webdataset:
+        logger.info(f"  Base source: {base_data_source}, format: WebDataset shards")
+        return None, None
+
+    if base_data_source in ("covla", "nuplan"):
+        return _cache_with_resume(args, model, exp, base_data_source, cache_dtype, device)
+
+    return _cache_simple(args, model, exp, cache_dtype, device)
+
+
+def _create_webdataset_loaders(
+    args: argparse.Namespace,
+    exp: "ExperimentPaths",
+    hidden_size: int,
+    sae_batch_size: int,
+) -> Tuple[DataLoader, Optional[DataLoader], Dict[str, Any], Dict[str, Any]]:
+    """Create WebDataset dataloaders for SAE training from sharded tar archives."""
+    wds_dir = exp.train_cache_dir
+    if not wds_dir.exists():
+        raise FileNotFoundError(
+            f"WebDataset directory not found: {wds_dir}\n"
+            f"Run the conversion script first: python sae/scripts/convert_to_webdataset.py"
+        )
+
+    available_shards = sorted(wds_dir.glob(f"layer_{args.layer}-train-*.tar"))
+    total_shards = len(available_shards)
+    if total_shards == 0:
+        raise FileNotFoundError(f"No shards found in {wds_dir}")
+
+    num_shards = args.num_shards or total_shards
+    if num_shards > total_shards:
+        logger.warning(f"Requested {num_shards} shards but only {total_shards} available. Using all.")
+        num_shards = total_shards
+
+    train_shards = [str(p) for p in available_shards[:num_shards]]
+    logger.info(f"WebDataset: {wds_dir}, {num_shards}/{total_shards} shards")
+
+    # 4 clips x 6 frames x 576 spatial = 13824 correlated tokens per shard file
+    CACHED_BATCH_SIZE = 13824
+    logger.info(f"Shuffle buffer: {args.shuffle_buffer:,} tokens")
+
+    train_act_loader, train_meta = create_webdataset_dataloader(
+        shard_pattern=train_shards,
+        batch_size=sae_batch_size,
+        shuffle_buffer=args.shuffle_buffer,
+        num_workers=DEFAULT_NUM_WORKERS,
+        seed=args.seed,
+        cached_batch_size=CACHED_BATCH_SIZE,
+    )
+
+    val_act_loader = None
+    val_meta: Dict[str, Any] = {"tokens_used": 0, "total_tokens": 0}
+    if exp.val_cache_dir.exists():
+        val_shards = sorted(exp.val_cache_dir.glob(f"layer_{args.layer}-val-*.tar"))
+        if len(val_shards) > 0:
+            logger.info(f"Using {len(val_shards)} WebDataset shards for validation")
+            val_act_loader, val_meta = create_webdataset_dataloader(
+                shard_pattern=[str(p) for p in val_shards],
+                batch_size=sae_batch_size,
+                shuffle_buffer=0,
+                num_workers=0,
+                seed=args.seed,
+                cached_batch_size=CACHED_BATCH_SIZE,
+            )
+            meta_path = exp.val_cache_dir / "_meta.json"
+            if meta_path.exists():
+                try:
+                    with open(meta_path, "r") as f:
+                        meta_json = json.load(f)
+                    if isinstance(meta_json, dict) and "total_tokens" in meta_json:
+                        val_meta["tokens_used"] = int(meta_json["total_tokens"])
+                        val_meta["total_tokens"] = int(meta_json["total_tokens"])
+                except Exception:
+                    pass
+        elif list(exp.val_cache_dir.glob("batch_*.pt")):
+            logger.info("Using individual .pt files for validation")
+            val_act_loader, val_meta = create_activation_dataloader(
+                exp.val_cache_dir, batch_size=sae_batch_size,
+                shuffle=False, num_workers=0, in_memory=True,
+                max_tokens=args.max_tokens,
+            )
+
+    if val_act_loader is None:
+        logger.warning("No validation cache found. Validation will be limited.")
+
+    val_meta["hidden_dim"] = hidden_size
+
+    estimated_batches_per_shard = 471
+    estimated_tokens = num_shards * estimated_batches_per_shard * CACHED_BATCH_SIZE
+    train_meta["tokens_used"] = estimated_tokens
+    train_meta["total_tokens"] = estimated_tokens
+    train_meta["estimated"] = True
+    train_meta["hidden_dim"] = hidden_size
+    train_meta["num_files"] = len(train_shards)
+
+    return train_act_loader, val_act_loader, train_meta, val_meta
+
+
+def _create_sae_dataloaders(
+    args: argparse.Namespace,
+    exp: "ExperimentPaths",
+    hidden_size: int,
+    use_webdataset: bool,
+    train_cache_files: Optional[List[Path]],
+    val_cache_files: Optional[List[Path]],
+) -> Tuple[DataLoader, Optional[DataLoader], Dict[str, Any], Dict[str, Any], int]:
+    """Create activation dataloaders for SAE training, dispatching by storage mode."""
+    sae_batch_size = resolve_sae_batch_size(
+        batch_size_arg=args.sae_batch_size, layer=args.layer,
+        expansion=args.expansion_factor, k=args.k,
+    )
+    logger.info(f"SAE batch size: {sae_batch_size:,} tokens")
+
+    if use_webdataset:
+        train_act_loader, val_act_loader, train_meta, val_meta = (
+            _create_webdataset_loaders(args, exp, hidden_size, sae_batch_size)
+        )
+    else:
+        in_memory = not args.streaming
+        logger.info(f"Creating activation dataloaders (streaming={args.streaming})...")
+        train_act_loader, train_meta = create_activation_dataloader(
+            exp.train_cache_dir, batch_size=sae_batch_size, shuffle=True,
+            num_workers=DEFAULT_NUM_WORKERS if args.streaming else 0,
+            in_memory=in_memory, max_tokens=args.max_tokens,
+        )
+        val_act_loader, val_meta = create_activation_dataloader(
+            exp.val_cache_dir, batch_size=sae_batch_size, shuffle=False,
+            num_workers=DEFAULT_NUM_WORKERS if args.streaming else 0,
+            in_memory=in_memory, max_tokens=args.max_tokens,
+        )
+
+    logger.info(f"Train tokens: {train_meta['tokens_used']:,}" + (" (estimated)" if train_meta.get("estimated") else ""))
+    logger.info(f"Val tokens: {val_meta['tokens_used']:,}")
+
+    steps_per_epoch = train_meta['tokens_used'] // sae_batch_size
+    logger.info(f"Steps per epoch: {steps_per_epoch:,}")
+
+    return train_act_loader, val_act_loader, train_meta, val_meta, steps_per_epoch
+
+
+def _start_monitoring(
+    args: argparse.Namespace,
+    exp: "ExperimentPaths",
+) -> GPUMonitor:
+    """Initialize timing stats and start GPU monitoring."""
+    stats.set_run_info(run_name=exp.barcode, layer=args.layer, data_source=args.data_source)
+
+    cache_path_str = str(exp.cache_dir)
+    if "/tmp" in cache_path_str or "/scratch" in cache_path_str:
+        data_source_type = "tmpdir"
+    elif "/data/lmb" in cache_path_str:
+        data_source_type = "NVMe_SSD"
+    else:
+        data_source_type = "NFS"
+    stats.set_data_source(source_type=data_source_type, path=cache_path_str)
+
+    gpu_monitor = GPUMonitor(sample_interval_s=2.0, device_id=0 if torch.cuda.is_available() else -1)
+    if torch.cuda.is_available():
+        gpu_monitor.start()
+    return gpu_monitor
+
+
+def main(args: argparse.Namespace, unknown_args: Sequence[str] = ()):
+    """Main training function."""
+    device = torch.device(args.device)
+    logger.info(f"Using device: {device}")
+
+    exp, model, hidden_size, use_webdataset, base_data_source, cache_dtype = (
+        _setup_experiment(args, device)
+    )
+
+    train_cache_files, val_cache_files = _prepare_and_cache_activations(
+        args, model, exp, base_data_source, use_webdataset, cache_dtype, device,
+    )
+
+    train_act_loader, val_act_loader, train_meta, val_meta, steps_per_epoch = (
+        _create_sae_dataloaders(
+            args, exp, hidden_size, use_webdataset, train_cache_files, val_cache_files,
+        )
+    )
+
+    sae, trainer, sae_config = _create_sae_and_trainer(args, hidden_size, device)
+    _save_experiment_config(args, exp, sae_config, train_meta, val_meta)
+    gpu_monitor = _start_monitoring(args, exp)
+
+    history, best_val_loss, training_start = _run_training_loop(
+        args, sae, trainer, train_act_loader, val_act_loader,
+        exp, use_webdataset, steps_per_epoch, gpu_monitor,
+    )
+
+    _finalize_training(
+        args, exp, sae, history, best_val_loss, training_start,
+        train_meta, val_meta, gpu_monitor, steps_per_epoch,
+    )
 
 
 def parse_args(argv=None):
@@ -1827,6 +1723,8 @@ def parse_args(argv=None):
                         help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=0.0,
                         help="Weight decay")
+    parser.add_argument("--max_grad_norm", type=float, default=1.0,
+                        help="Max gradient norm for clipping (0 to disable)")
     parser.add_argument("--sae_batch_size", type=str, default="4096",
                         help="SAE batch size in tokens (default: 4096). "
                              "Use 'auto' to read from calibration resource file.")

@@ -39,11 +39,11 @@
 
 #SBATCH --job-name=sae_train
 #SBATCH --time=24:00:00
-#SBATCH --partition=tflmb_gpu-rtx4090
+#SBATCH --partition=tflmb_gpu-rtx3090
 #SBATCH --account=lmbhiwi-dlc
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=150GB
+#SBATCH --mem=90GB
 #SBATCH --output=/work/dlclarge2/lushtake-thesis/orbis/sae/slurm/logs/slurm_init_%j.out
 #SBATCH --error=/work/dlclarge2/lushtake-thesis/orbis/sae/slurm/logs/slurm_init_%j.err
 
@@ -229,6 +229,7 @@ export MKL_INTERFACE_LAYER="GNU"
 export MKL_THREADING_LAYER="GNU"
 export TK_WORK_DIR="${ORBIS_ROOT}/logs_tk"
 export OMP_NUM_THREADS=1
+export TQDM_MININTERVAL=60
 
 set +u
 source ~/.bashrc

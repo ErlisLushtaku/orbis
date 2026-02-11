@@ -20,11 +20,56 @@ from tqdm import tqdm
 import numpy as np
 import matplotlib.pyplot as plt
 
-from .activation_hooks import ActivationIntervenor, ActivationExtractor, ZeroAblationIntervenor
+from .activation_hooks import ActivationIntervenor, ZeroAblationIntervenor
 from .topk_sae import TopKSAE
-from .utils.logging_utils import get_logger, format_duration
+from .utils.constants import EPSILON, HISTOGRAM_BINS, PLOT_DPI
+from .utils.data_utils import extract_batch_images, compute_ground_truth
+from .utils.logging import get_logger, format_duration
 
 logger = get_logger(__name__)
+
+
+def _forward_with_activations(
+    model: nn.Module,
+    batch,
+    t_noise: float,
+    frame_rate: int,
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+    """Run Orbis forward pass setup and return tensors needed for metric computation.
+
+    Shared by compute_loss_recovered and compute_normalized_loss_recovered.
+
+    Returns:
+        Tuple of (target, context, t, fr, gt_target) where context may be None
+        for single-frame inputs.
+    """
+    imgs = extract_batch_images(batch).to(device)
+    b = imgs.shape[0]
+
+    x = model.encode_frames(imgs)
+    t = torch.full((b,), t_noise, device=device)
+
+    if t_noise > 0:
+        target_t, noise = model.add_noise(x, t)
+    else:
+        target_t = x
+        noise = torch.zeros_like(x)
+
+    if target_t.dim() == 4:
+        target_t = target_t.unsqueeze(1)
+
+    fr = torch.full((b,), frame_rate, device=device)
+
+    if target_t.shape[1] > 1:
+        context = target_t[:, :-1]
+        target = target_t[:, -1:]
+    else:
+        context = None
+        target = target_t
+
+    gt_target = compute_ground_truth(model, x, noise, t)
+    return target, context, t, fr, gt_target
 
 
 @torch.no_grad()
@@ -73,69 +118,31 @@ def compute_loss_recovered(
     iterator = tqdm(islice(dataloader, max_batches), total=max_batches, desc="Computing Loss Recovered")
     
     for batch in iterator:
-        # Handle batch format
-        if isinstance(batch, (list, tuple)):
-            imgs = batch[0]
-        elif isinstance(batch, dict):
-            imgs = batch.get('images', batch.get('image'))
-        else:
-            imgs = batch
-        
-        imgs = imgs.to(device)
-        b = imgs.shape[0]
-        
-        # Encode frames
-        x = model.encode_frames(imgs)
-        
-        # Setup for forward pass
-        t = torch.full((b,), t_noise, device=device)
-        
-        if t_noise > 0:
-            target_t, noise = model.add_noise(x, t)
-        else:
-            target_t = x
-            noise = torch.zeros_like(x)
-        
-        if target_t.dim() == 4:
-            target_t = target_t.unsqueeze(1)
-        
-        fr = torch.full((b,), frame_rate, device=device)
-        
-        # Prepare context and target
-        if target_t.shape[1] > 1:
-            context = target_t[:, :-1]
-            target = target_t[:, -1:]
-        else:
-            context = None
-            target = target_t
-        
-        # Ground truth (velocity field target)
-        gt_target = model.A(t).view(-1, 1, 1, 1) * x[:, -1] + model.B(t).view(-1, 1, 1, 1) * noise[:, -1] \
-                    if x.dim() == 5 else model.A(t).view(-1, 1, 1, 1) * x + model.B(t).view(-1, 1, 1, 1) * noise
-        
+        target, context, t, fr, gt_target = _forward_with_activations(
+            model, batch, t_noise, frame_rate, device,
+        )
+
         # Baseline prediction (no intervention)
         baseline_pred = model.vit(target, context, t, frame_rate=fr)
         baseline_error = F.mse_loss(baseline_pred.float(), gt_target.float())
         baseline_errors.append(baseline_error.item())
-        
+
         # SAE intervention prediction
         with interventor.intervene():
             sae_pred = model.vit(target, context, t, frame_rate=fr)
         sae_error = F.mse_loss(sae_pred.float(), gt_target.float())
         sae_errors.append(sae_error.item())
-    
-    # Compute averages
+
     baseline_avg = np.mean(baseline_errors)
     sae_avg = np.mean(sae_errors)
-    
     # Loss recovered (1.0 = perfect, 0.0 = doubled error)
-    loss_recovered = 1.0 - (sae_avg / (baseline_avg + 1e-8))
+    loss_recovered = 1.0 - (sae_avg / (baseline_avg + EPSILON))
     
     return {
         "baseline_error": baseline_avg,
         "sae_error": sae_avg,
         "loss_recovered": loss_recovered,
-        "error_ratio": sae_avg / (baseline_avg + 1e-8),
+        "error_ratio": sae_avg / (baseline_avg + EPSILON),
     }
 
 
@@ -195,74 +202,37 @@ def compute_normalized_loss_recovered(
     iterator = tqdm(islice(dataloader, max_batches), total=max_batches, desc="Computing Normalized Loss Recovered")
     
     for batch in iterator:
-        # Handle batch format
-        if isinstance(batch, (list, tuple)):
-            imgs = batch[0]
-        elif isinstance(batch, dict):
-            imgs = batch.get('images', batch.get('image'))
-        else:
-            imgs = batch
-        
-        imgs = imgs.to(device)
-        b = imgs.shape[0]
-        
-        # Encode frames
-        x = model.encode_frames(imgs)
-        
-        # Setup for forward pass
-        t = torch.full((b,), t_noise, device=device)
-        
-        if t_noise > 0:
-            target_t, noise = model.add_noise(x, t)
-        else:
-            target_t = x
-            noise = torch.zeros_like(x)
-        
-        if target_t.dim() == 4:
-            target_t = target_t.unsqueeze(1)
-        
-        fr = torch.full((b,), frame_rate, device=device)
-        
-        # Prepare context and target
-        if target_t.shape[1] > 1:
-            context = target_t[:, :-1]
-            target = target_t[:, -1:]
-        else:
-            context = None
-            target = target_t
-        
-        # Ground truth (velocity field target)
-        gt_target = model.A(t).view(-1, 1, 1, 1) * x[:, -1] + model.B(t).view(-1, 1, 1, 1) * noise[:, -1] \
-                    if x.dim() == 5 else model.A(t).view(-1, 1, 1, 1) * x + model.B(t).view(-1, 1, 1, 1) * noise
-        
+        target, context, t, fr, gt_target = _forward_with_activations(
+            model, batch, t_noise, frame_rate, device,
+        )
+
         # L_base: Baseline prediction (no intervention)
         baseline_pred = model.vit(target, context, t, frame_rate=fr)
         baseline_error = F.mse_loss(baseline_pred.float(), gt_target.float())
         baseline_errors.append(baseline_error.item())
-        
+
         # L_sae: SAE intervention prediction
         with sae_interventor.intervene():
             sae_pred = model.vit(target, context, t, frame_rate=fr)
         sae_error = F.mse_loss(sae_pred.float(), gt_target.float())
         sae_errors.append(sae_error.item())
-        
+
         # L_zero: Zero ablation prediction (worst case)
         with zero_interventor.intervene():
             zero_pred = model.vit(target, context, t, frame_rate=fr)
         zero_error = F.mse_loss(zero_pred.float(), gt_target.float())
         zero_errors.append(zero_error.item())
     
-    # Compute averages
     L_base = np.mean(baseline_errors)
     L_sae = np.mean(sae_errors)
     L_zero = np.mean(zero_errors)
-    
-    # Normalized Loss Recovered: (L_zero - L_sae) / (L_zero - L_base)
+
+    # NLR = (L_zero - L_sae) / (L_zero - L_base)
     # Measures what fraction of the gap between worst-case and baseline is recovered
     denominator = L_zero - L_base
-    if abs(denominator) < 1e-8:
+    if abs(denominator) < EPSILON:
         # Edge case: baseline equals zero ablation (layer has no effect)
-        normalized_loss_recovered = 1.0 if abs(L_sae - L_base) < 1e-8 else 0.0
+        normalized_loss_recovered = 1.0 if abs(L_sae - L_base) < EPSILON else 0.0
     else:
         normalized_loss_recovered = (L_zero - L_sae) / denominator
     
@@ -272,7 +242,7 @@ def compute_normalized_loss_recovered(
         "L_zero": L_zero,
         "normalized_loss_recovered": normalized_loss_recovered,
         # Also include the simple loss recovered for comparison
-        "loss_recovered_simple": 1.0 - (L_sae / (L_base + 1e-8)),
+        "loss_recovered_simple": 1.0 - (L_sae / (L_base + EPSILON)),
     }
 
 
@@ -311,10 +281,7 @@ def compute_dead_features(
     for batch in iterator:
         batch = batch.to(device)
         
-        # Get sparse activations
         sparse_acts = sae.encode(batch)
-        
-        # Mark features that activated at least once
         batch_active = (sparse_acts > threshold).any(dim=0)
         feature_ever_active = feature_ever_active | batch_active
     
@@ -370,10 +337,7 @@ def compute_dictionary_coverage(
         batch = batch.to(device)
         batch_size = batch.shape[0]
         
-        # Get sparse activations
         sparse_acts = sae.encode(batch)
-        
-        # Mark features that activated at least once
         batch_active = (sparse_acts > 0).any(dim=0)
         feature_ever_active = feature_ever_active | batch_active
         total_samples += batch_size
@@ -422,18 +386,14 @@ def compute_activation_density(
         batch = batch.to(device)
         batch_size = batch.shape[0]
         
-        # Get sparse activations
         sparse_acts = sae.encode(batch)
-        
-        # Count activations per feature
         activations = (sparse_acts > 0).sum(dim=0)
         feature_activation_counts += activations
         total_samples += batch_size
     
-    # Compute density (fraction of samples where each feature activates)
+    # Density: fraction of samples where each feature activates
     density = (feature_activation_counts.float() / total_samples).cpu().numpy()
-    
-    # Compute statistics
+
     stats = {
         "mean_density": float(np.mean(density)),
         "median_density": float(np.median(density)),
@@ -443,8 +403,7 @@ def compute_activation_density(
         "total_samples": total_samples,
     }
     
-    # Histogram bins
-    hist_counts, hist_edges = np.histogram(density, bins=50)
+    hist_counts, hist_edges = np.histogram(density, bins=HISTOGRAM_BINS)
     stats["histogram_counts"] = hist_counts.tolist()
     stats["histogram_edges"] = hist_edges.tolist()
     stats["density_per_feature"] = density.tolist()
@@ -496,8 +455,7 @@ def compute_temporal_stability(
     
     d_sae = sae.d_sae
     
-    # Accumulators for computing correlation across batches
-    # We'll collect all per-feature autocorrelations and average at the end
+    # Collect per-feature autocorrelations across batches and average at the end
     all_feature_autocorrs = []
     
     iterator = tqdm(islice(temporal_dataloader, max_batches), total=max_batches, desc="Computing temporal stability")
@@ -506,10 +464,8 @@ def compute_temporal_stability(
         batch = batch.to(device)
         batch_size = batch.shape[0]
         
-        # Get sparse activations for all tokens in batch
-        sparse_acts = sae.encode(batch)  # (batch_size, d_sae)
-        
-        # Infer num_spatial_tokens if not provided
+        sparse_acts = sae.encode(batch)
+
         if num_spatial_tokens is None:
             # Assume batch is flattened (B * F * N, d_in) where B=clips, F=frames, N=spatial
             # Try to infer N from total tokens and num_frames
@@ -546,29 +502,23 @@ def compute_temporal_stability(
         acts_t = acts_per_frame[:, :-1, :]   # (num_clips, num_frames-1, d_sae)
         acts_t1 = acts_per_frame[:, 1:, :]   # (num_clips, num_frames-1, d_sae)
         
-        # Flatten clips and time for correlation computation
-        # Shape: (num_clips * (num_frames-1), d_sae)
+        # Flatten clips and time: (num_clips * (num_frames-1), d_sae)
         acts_t_flat = acts_t.reshape(-1, d_sae)
         acts_t1_flat = acts_t1.reshape(-1, d_sae)
         
-        # Compute Pearson correlation for each feature
-        # corr(X, Y) = cov(X,Y) / (std(X) * std(Y))
+        # Pearson correlation per feature: corr(X, Y) = cov(X,Y) / (std(X) * std(Y))
         mean_t = acts_t_flat.mean(dim=0, keepdim=True)
         mean_t1 = acts_t1_flat.mean(dim=0, keepdim=True)
         
         acts_t_centered = acts_t_flat - mean_t
         acts_t1_centered = acts_t1_flat - mean_t1
         
-        # Covariance (sum of products / n)
         cov = (acts_t_centered * acts_t1_centered).mean(dim=0)
-        
-        # Standard deviations
         std_t = acts_t_centered.std(dim=0)
         std_t1 = acts_t1_centered.std(dim=0)
         
-        # Pearson correlation per feature
         # Avoid division by zero for dead features
-        denom = std_t * std_t1 + 1e-8
+        denom = std_t * std_t1 + EPSILON
         autocorr = cov / denom  # (d_sae,)
         
         all_feature_autocorrs.append(autocorr.cpu())
@@ -581,10 +531,8 @@ def compute_temporal_stability(
             "error": "No valid batches for temporal analysis",
         }
     
-    # Average autocorrelations across all batches
-    stacked = torch.stack(all_feature_autocorrs, dim=0)  # (num_batches, d_sae)
-    mean_per_feature = stacked.mean(dim=0).numpy()  # (d_sae,)
-    
+    stacked = torch.stack(all_feature_autocorrs, dim=0)
+    mean_per_feature = stacked.mean(dim=0).numpy()
     # Filter out NaN values (from dead features)
     valid_autocorrs = mean_per_feature[~np.isnan(mean_per_feature)]
     
@@ -628,7 +576,7 @@ def plot_activation_density_histogram(
     
     density = np.array(density_stats["density_per_feature"])
     
-    ax.hist(density, bins=50, edgecolor='black', alpha=0.7)
+    ax.hist(density, bins=HISTOGRAM_BINS, edgecolor='black', alpha=0.7)
     ax.axvline(density_stats["mean_density"], color='red', linestyle='--', 
                label=f'Mean: {density_stats["mean_density"]:.4f}')
     ax.axvline(density_stats["median_density"], color='green', linestyle='--',
@@ -639,7 +587,6 @@ def plot_activation_density_histogram(
     ax.set_title(title)
     ax.legend()
     
-    # Add text box with statistics
     textstr = f'Dead: {(density == 0).sum()}\nTotal: {len(density)}'
     props = dict(boxstyle='round', facecolor='wheat', alpha=0.5)
     ax.text(0.95, 0.95, textstr, transform=ax.transAxes, fontsize=10,
@@ -648,7 +595,7 @@ def plot_activation_density_histogram(
     plt.tight_layout()
     
     if save_path:
-        fig.savefig(save_path, dpi=150, bbox_inches='tight')
+        fig.savefig(save_path, dpi=PLOT_DPI, bbox_inches='tight')
         logger.info(f"Saved density histogram to {save_path}")
     
     return fig
@@ -692,10 +639,7 @@ def run_full_evaluation(
     results = {}
     timing = {}
     
-    # 1. Loss Recovered
-    logger.info("=" * 60)
     logger.info("Computing Loss Recovered...")
-    logger.info("=" * 60)
     start_time = time.perf_counter()
     loss_results = compute_loss_recovered(
         model, sae, image_dataloader, layer_idx, device,
@@ -708,10 +652,7 @@ def run_full_evaluation(
     logger.info(f"  Loss Recovered: {loss_results['loss_recovered']:.4f}")
     logger.info(f"  Time: {format_duration(timing['loss_recovered'])}")
     
-    # 2. Dead Features
-    logger.info("=" * 60)
     logger.info("Computing Dead Features...")
-    logger.info("=" * 60)
     start_time = time.perf_counter()
     dead_results = compute_dead_features(
         sae, activation_dataloader, device, max_batches=max_batches_density
@@ -725,10 +666,7 @@ def run_full_evaluation(
     logger.info(f"  Alive Features: {dead_results['num_alive']}")
     logger.info(f"  Time: {format_duration(timing['dead_features'])}")
     
-    # 3. Activation Density
-    logger.info("=" * 60)
     logger.info("Computing Activation Density...")
-    logger.info("=" * 60)
     start_time = time.perf_counter()
     density_results = compute_activation_density(
         sae, activation_dataloader, device, max_batches=max_batches_density
@@ -742,7 +680,6 @@ def run_full_evaluation(
     logger.info(f"  Std Density:    {density_results['std_density']:.4f}")
     logger.info(f"  Time: {format_duration(timing['activation_density'])}")
     
-    # Plot and save density histogram
     fig = plot_activation_density_histogram(
         density_results,
         save_path=str(output_dir / "activation_density_histogram.png"),
@@ -751,15 +688,13 @@ def run_full_evaluation(
     plt.close(fig)
     
     # Save full density array separately (can be large)
-    np.save(output_dir / "density_per_feature.npy", 
+    np.save(output_dir / "density_per_feature.npy",
             np.array(density_results["density_per_feature"]))
-    
-    # Add timing to results
+
     results["timing"] = timing
     total_time = sum(timing.values())
     results["timing"]["total"] = total_time
     
-    # Save results
     import json
     with open(output_dir / "evaluation_results.json", "w") as f:
         json.dump(results, f, indent=2)

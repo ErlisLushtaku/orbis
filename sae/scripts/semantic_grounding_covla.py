@@ -1,18 +1,17 @@
 """
 Post-Training Semantic Grounding Analysis for Orbis SAE.
 
-This script analyzes trained SAE latents by computing correlations with
-CoVLA metadata fields (tunnel, highway, pedestrian, risk confidence scores)
-on a held-out test set.
+Analyzes trained SAE latents by computing correlations with CoVLA metadata
+fields (tunnel, highway, pedestrian, risk confidence scores) on a held-out
+test set.
 
-Requirements:
-- Trained SAE checkpoint
-- Orbis world model checkpoint
-- Held-out test videos (not used in SAE training)
-- CoVLA captions with confidence scores
+Produces multi-granularity visualizations for manual concept discovery:
+- Clips (mp4): temporal driving behavior
+- Frames (PNG): target frame snapshots
+- Patches (heatmap): spatial activation maps showing where in the image a latent fires
 
 Usage:
-    python sae/semantic_grounding.py \
+    python sae/scripts/semantic_grounding_covla.py \
         --exp_dir /path/to/orbis_288x512 \
         --sae_checkpoint /path/to/sae/best.pt \
         --test_videos_dir /path/to/test_videos \
@@ -26,7 +25,7 @@ import argparse
 import json
 import os
 import sys
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 import warnings
@@ -34,20 +33,29 @@ import warnings
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset, Subset
 from tqdm import tqdm
 from PIL import Image
-from scipy import stats
 
 # Add orbis root to path for imports (scripts are in sae/scripts/, go up 2 levels)
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from sae.topk_sae import TopKSAE, TopKSAEConfig
+from sae.topk_sae import TopKSAE
 from sae.activation_hooks import ActivationExtractor
-from sae.caching import prepare_activation_cache, load_activation_cache, resolve_cache_dtype
-from sae.utils.logging_utils import get_logger, setup_sae_logging
+from sae.scripts.grounding_analysis import (
+    CorrelationResult,
+    PureFeature,
+    compute_correlations as _compute_correlations,
+    find_pure_features,
+    find_top_activating_frames as _find_top_activating_frames,
+    find_top_activating_latents,
+)
+from sae.utils.constants import ORBIS_GRID_H, ORBIS_GRID_W
+from sae.utils.logging import get_logger, setup_sae_logging
+from sae.utils.model_loading import load_orbis_model, load_sae
+from sae.utils.spatial_tracker import SpatialEntry, SpatialTopKTracker
+from sae.utils.viz import create_clip_video, create_patch_heatmap, save_frame_png
 from data.covla.covla_dataset import CoVLAOrbisMultiFrame
-from util import instantiate_from_config
 
 # Setup logging
 setup_sae_logging()
@@ -79,83 +87,102 @@ class FrameActivation:
     rich_caption: str = ""
 
 
-@dataclass 
-class CorrelationResult:
-    """Correlation between a latent and metadata field."""
-    latent_idx: int
-    field_name: str
-    pearson_r: float
-    p_value: float
-    num_samples: int
+def create_val_dataset_covla(
+    videos_dir: str,
+    captions_dir: str,
+    input_size: Tuple[int, int] = (288, 512),
+    num_frames: int = 6,
+    stored_frame_rate: int = 20,
+    frame_rate: int = 5,
+    num_videos: Optional[int] = None,
+    val_split: float = 0.1,
+) -> Tuple[Subset, "CoVLAOrbisMultiFrame"]:
+    """Create the val dataset using the same split logic as SAE training.
+
+    Returns:
+        Tuple of (val_subset, full_dataset) so the wrapper can access dataset internals.
+    """
+    full_dataset = CoVLAOrbisMultiFrame(
+        num_frames=num_frames,
+        stored_data_frame_rate=stored_frame_rate,
+        target_frame_rate=frame_rate,
+        size=input_size,
+        captions_dir=captions_dir,
+        videos_dir=videos_dir,
+        num_samples=num_videos,
+        debug=False,
+    )
+
+    total_videos = full_dataset.num_videos
+    clips_per_video = full_dataset.clips_per_video
+
+    num_val_videos = max(1, int(total_videos * val_split))
+    num_train_videos = total_videos - num_val_videos
+
+    train_end_idx = num_train_videos * clips_per_video
+    val_indices = list(range(train_end_idx, len(full_dataset)))
+
+    val_subset = Subset(full_dataset, val_indices)
+
+    logger.info(
+        f"CoVLA val split: {total_videos} total videos, "
+        f"{num_train_videos} train / {num_val_videos} val, "
+        f"{len(val_subset)} val clips"
+    )
+
+    return val_subset, full_dataset
 
 
-@dataclass
-class PureFeature:
-    """A latent that strongly correlates with exactly one metadata field."""
-    latent_idx: int
-    primary_field: str
-    primary_correlation: float
-    other_correlations: Dict[str, float]
-    top_frames: List[Dict[str, Any]] = field(default_factory=list)
+class CoVLAValWrapper(Dataset):  # type: ignore[type-arg]
+    """Wraps a CoVLAOrbisMultiFrame val Subset to produce the format expected by custom_collate.
 
+    CoVLAOrbisMultiFrame returns {images, caption, video_id, frame_rate}.
+    The grounding pipeline expects {image, video_id, frame_idx, clip_frame_indices, metadata}.
+    This wrapper bridges the gap by computing clip frame indices and loading per-frame metadata.
+    """
 
-def load_orbis_model(
-    config_path: Path,
-    ckpt_path: Path,
-    device: torch.device,
-) -> nn.Module:
-    """Load the frozen Orbis world model."""
-    from omegaconf import OmegaConf
-    
-    logger.info(f" Loading config from {config_path}")
-    cfg_model = OmegaConf.load(config_path)
-    
-    logger.info(f" Instantiating model...")
-    model = instantiate_from_config(cfg_model.model)
-    
-    # Load checkpoint
-    logger.info(f" Loading checkpoint from {ckpt_path}")
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    if "state_dict" in ckpt:
-        state_dict = ckpt["state_dict"]
-    else:
-        state_dict = ckpt
-    
-    model.load_state_dict(state_dict, strict=False)
-    
-    model = model.to(device)
-    model.eval()
-    
-    # Freeze all parameters
-    for param in model.parameters():
-        param.requires_grad = False
-    
-    logger.info(f" Model loaded and frozen")
-    return model
+    def __init__(
+        self,
+        val_subset: Subset,
+        full_dataset: "CoVLAOrbisMultiFrame",
+        captions_dir: str,
+    ):
+        self.val_subset = val_subset
+        self.full_dataset = full_dataset
+        self.captions_dir = Path(captions_dir)
 
+    def __len__(self) -> int:
+        return len(self.val_subset)
 
-def load_sae(checkpoint_path: Path, device: torch.device) -> TopKSAE:
-    """Load trained SAE from checkpoint."""
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    
-    if 'config' in checkpoint:
-        config = checkpoint['config']
-        if isinstance(config, dict):
-            config = TopKSAEConfig(**config)
-        sae = TopKSAE(config)
-        # Handle both 'state_dict' and 'model_state_dict' keys
-        state_dict_key = 'state_dict' if 'state_dict' in checkpoint else 'model_state_dict'
-        sae.load_state_dict(checkpoint[state_dict_key])
-    else:
-        raise ValueError(f"Unknown checkpoint format: {checkpoint.keys()}")
-    
-    sae.to(device)
-    sae.eval()
-    
-    for param in sae.parameters():
-        param.requires_grad = False
-    
-    return sae
+    def __getitem__(self, idx: int) -> Dict:
+        sample = self.val_subset[idx]
+
+        # Recover the full-dataset flat index to compute clip frame indices
+        full_idx = self.val_subset.indices[idx]
+        video_idx = full_idx // self.full_dataset.clips_per_video
+        clip_idx = full_idx % self.full_dataset.clips_per_video
+        video_id = self.full_dataset.video_ids[video_idx]
+
+        # Get clip frame indices (requires total_frames from video)
+        from decord import VideoReader, cpu
+        video_path = os.path.join(self.full_dataset.videos_dir, f"{video_id}.mp4")
+        vr = VideoReader(video_path, ctx=cpu(0))
+        total_frames = len(vr)
+        del vr
+
+        frame_indices = self.full_dataset._get_clip_frame_indices(clip_idx, total_frames)
+        target_frame_idx = frame_indices[-1]
+
+        metadata = load_frame_metadata(self.captions_dir, video_id, target_frame_idx)
+
+        return {
+            "image": sample["images"],  # (T, 3, H, W)
+            "video_id": video_id,
+            "frame_idx": target_frame_idx,
+            "clip_frame_indices": frame_indices,
+            "metadata": metadata,
+        }
+
 
 
 def load_frame_metadata(captions_dir: Path, video_id: str, frame_idx: int) -> Dict[str, Any]:
@@ -298,22 +325,24 @@ class TestDataset(torch.utils.data.Dataset):
             "image": clip_tensor,  # (T, 3, H, W)
             "video_id": video_id,
             "frame_idx": target_frame_idx,  # Target frame index
+            "clip_frame_indices": frame_indices,
             "metadata": metadata,
         }
 
 
 def custom_collate(batch: List[Dict]) -> Dict:
     """Custom collate that handles metadata dicts and multi-frame clips."""
-    # Stack images: handles both (3, H, W) and (T, 3, H, W)
     images = torch.stack([item["image"] for item in batch])
     video_ids = [item["video_id"] for item in batch]
     frame_idxs = [item["frame_idx"] for item in batch]
+    clip_frame_indices = [item["clip_frame_indices"] for item in batch]
     metadata_list = [item["metadata"] for item in batch]
     
     return {
         "images": images,  # (B, T, 3, H, W) or (B, 3, H, W)
         "video_ids": video_ids,
         "frame_idxs": frame_idxs,
+        "clip_frame_indices": clip_frame_indices,
         "metadata": metadata_list,
     }
 
@@ -412,6 +441,7 @@ def cache_orbis_activations_with_metadata(
         imgs = batch["images"].to(device)  # (B, T, 3, H, W)
         video_ids = batch["video_ids"]
         frame_idxs = batch["frame_idxs"]
+        clip_frame_indices = batch["clip_frame_indices"]
         metadata_list = batch["metadata"]
         
         b = imgs.shape[0]
@@ -422,21 +452,20 @@ def cache_orbis_activations_with_metadata(
         
         t_frames = imgs.shape[1]
         
-        # Encode frames through tokenizer
+        # Encode frames and apply sigma_min noise (matches cache creation)
         x = orbis_model.encode_frames(imgs)
-        
-        # Prepare for transformer (no noise for analysis)
         t_noise = torch.zeros(b, device=device)
+        x_noised, _ = orbis_model.add_noise(x, t_noise)
         fr = torch.full((b,), frame_rate, device=device)
         
         # Split into context and target
         if t_frames > 1:
-            context = x[:, :-1]
-            target = x[:, -1:]
+            context = x_noised[:, :-1]
+            target = x_noised[:, -1:]
         else:
             warnings.warn("Single-frame input detected - activations may be out-of-distribution")
-            context = x
-            target = x
+            context = x_noised
+            target = x_noised
         
         # Extract activations from transformer
         with extractor.capture():
@@ -466,6 +495,7 @@ def cache_orbis_activations_with_metadata(
             all_sample_metadata.append({
                 "video_id": video_ids[i],
                 "frame_idx": frame_idxs[i],
+                "clip_frame_indices": clip_frame_indices[i],
                 "metadata": meta_scores,
                 "rich_caption": metadata.get("rich_caption", ""),
                 "spatial_tokens": spatial_tokens,
@@ -503,25 +533,25 @@ def collect_activations(
     frame_rate: int = 5,
     cache_dir: Optional[Path] = None,
     rebuild_cache: bool = False,
-) -> List[FrameActivation]:
+    spatial_cache_path: Optional[Path] = None,
+    top_k_frames: int = 10,
+) -> Tuple[List[FrameActivation], Optional[SpatialTopKTracker]]:
     """
     Process test video clips and collect SAE latent activations per target frame.
     
-    Caches raw Orbis activations in sae_cache/test/ (same format as train/val).
-    Encodes through SAE on-the-fly when loading from cache.
+    Single-pass collection: computes spatially-averaged activations for
+    correlation analysis AND maintains per-latent top-K spatial activation
+    maps for visualization.
     
-    Args:
-        orbis_model: Orbis world model
-        sae: Trained SAE model
-        dataloader: DataLoader returning clips with metadata
-        layer_idx: Transformer layer to extract from
-        device: Device to run on
-        frame_rate: Frame rate conditioning value
-        cache_dir: Directory for Orbis activation cache (logs_sae/sae_cache/.../test/)
-        rebuild_cache: Force rebuild of cache even if it exists
-    
-    Returns list of FrameActivation objects with SAE latent activations and metadata.
+    Returns:
+        Tuple of (activations list, spatial tracker or None).
     """
+    tracker = None
+
+    # Check for existing spatial cache
+    if spatial_cache_path and spatial_cache_path.exists() and not rebuild_cache:
+        tracker = SpatialTopKTracker.load(spatial_cache_path)
+
     # Cache or load Orbis activations
     if cache_dir is not None:
         cache_files, sample_metadata = cache_orbis_activations_with_metadata(
@@ -534,35 +564,49 @@ def collect_activations(
             rebuild=rebuild_cache,
         )
         
-        # Load cached activations and encode through SAE
-        logger.info(f" Encoding cached activations through SAE...")
+        logger.info(" Encoding cached activations through SAE...")
         all_activations: List[FrameActivation] = []
         sample_idx = 0
+        d_sae = sae.config.d_sae
+        need_tracker = tracker is None and spatial_cache_path is not None
+        if need_tracker:
+            tracker = SpatialTopKTracker(num_latents=d_sae, top_k=top_k_frames)
         
         for cache_file in tqdm(cache_files, desc="Processing cached activations"):
             data = torch.load(cache_file, weights_only=True)
-            acts = data["activations"].to(device).float()  # (batch * spatial, hidden_dim)
+            acts = data["activations"].to(device).float()
             
-            # Determine batch size from metadata
-            # Each sample has spatial_tokens entries in the activations
             batch_start = sample_idx
             while sample_idx < len(sample_metadata):
                 meta = sample_metadata[sample_idx]
                 spatial_tokens = meta["spatial_tokens"]
                 
-                # Check if we have enough activations left for this sample
                 acts_needed = (sample_idx - batch_start + 1) * spatial_tokens
                 if acts_needed > acts.shape[0]:
                     break
                 
-                # Extract this sample's activations
                 start_idx = (sample_idx - batch_start) * spatial_tokens
                 end_idx = start_idx + spatial_tokens
                 sample_acts = acts[start_idx:end_idx]  # (spatial, hidden_dim)
                 
-                # Encode through SAE
                 sae_acts = sae.encode(sample_acts)  # (spatial, num_latents)
-                sae_acts_mean = sae_acts.mean(dim=0).cpu().numpy()  # (num_latents,)
+                sae_acts_mean = sae_acts.mean(dim=0).cpu().numpy()
+                
+                # Update spatial tracker (target frame only = last 576 tokens)
+                if need_tracker and tracker is not None:
+                    num_spatial = ORBIS_GRID_H * ORBIS_GRID_W  # 576
+                    target_spatial = sae_acts[-num_spatial:, :].cpu().numpy()  # (576, num_latents)
+                    tracker_meta = [{
+                        "video_id": meta["video_id"],
+                        "frame_idx": meta["frame_idx"],
+                        "clip_frame_indices": meta.get("clip_frame_indices", []),
+                        "metadata": meta["metadata"],
+                    }]
+                    tracker.update(
+                        sae_acts_mean[np.newaxis, :],
+                        target_spatial[np.newaxis, :, :],
+                        tracker_meta,
+                    )
                 
                 frame_act = FrameActivation(
                     video_id=meta["video_id"],
@@ -574,16 +618,24 @@ def collect_activations(
                 all_activations.append(frame_act)
                 sample_idx += 1
         
-        return all_activations
+        if spatial_cache_path and need_tracker and tracker is not None:
+            tracker.save(spatial_cache_path)
+        
+        return all_activations, tracker
     
     # No caching - compute directly (fallback)
     extractor = ActivationExtractor(orbis_model, layer_idx=layer_idx, flatten_spatial=True)
     all_activations: List[FrameActivation] = []
+    d_sae = sae.config.d_sae
+    need_tracker = tracker is None and spatial_cache_path is not None
+    if need_tracker:
+        tracker = SpatialTopKTracker(num_latents=d_sae, top_k=top_k_frames)
     
     for batch in tqdm(dataloader, desc="Collecting activations"):
         imgs = batch["images"].to(device)
         video_ids = batch["video_ids"]
         frame_idxs = batch["frame_idxs"]
+        clip_frame_indices = batch["clip_frame_indices"]
         metadata_list = batch["metadata"]
         
         b = imgs.shape[0]
@@ -593,17 +645,17 @@ def collect_activations(
         
         t_frames = imgs.shape[1]
         x = orbis_model.encode_frames(imgs)
-        
         t_noise = torch.zeros(b, device=device)
+        x_noised, _ = orbis_model.add_noise(x, t_noise)
         fr = torch.full((b,), frame_rate, device=device)
         
         if t_frames > 1:
-            context = x[:, :-1]
-            target = x[:, -1:]
+            context = x_noised[:, :-1]
+            target = x_noised[:, -1:]
         else:
             warnings.warn("Single-frame input detected")
-            context = x
-            target = x
+            context = x_noised
+            target = x_noised
         
         with extractor.capture():
             _ = orbis_model.vit(target, context, t_noise, frame_rate=fr)
@@ -612,14 +664,32 @@ def collect_activations(
         spatial_tokens = acts.shape[0] // b
         acts = acts.view(b, spatial_tokens, -1)
         
-        sae_acts = sae.encode(acts.float())
+        sae_acts = sae.encode(acts.float())  # (B, N, d_sae)
         sae_acts_mean = sae_acts.mean(dim=1).cpu().numpy()
+        
+        # Update spatial tracker (target frame only = last 576 tokens)
+        if need_tracker and tracker is not None:
+            num_spatial = ORBIS_GRID_H * ORBIS_GRID_W  # 576
+            target_spatial = sae_acts[:, -num_spatial:, :].cpu().numpy()  # (B, 576, d_sae)
+            batch_metadata = [
+                {
+                    "video_id": video_ids[i],
+                    "frame_idx": frame_idxs[i],
+                    "clip_frame_indices": clip_frame_indices[i],
+                    "metadata": {
+                        f_name: metadata_list[i].get(f_name, np.nan)
+                        for f_name in METADATA_FIELDS + CONTEXT_FIELDS
+                    },
+                }
+                for i in range(b)
+            ]
+            tracker.update(sae_acts_mean, target_spatial, batch_metadata)
         
         for i in range(b):
             metadata = metadata_list[i]
             meta_scores = {
-                field: metadata.get(field, np.nan)
-                for field in METADATA_FIELDS + CONTEXT_FIELDS
+                f_name: metadata.get(f_name, np.nan)
+                for f_name in METADATA_FIELDS + CONTEXT_FIELDS
             }
             
             frame_act = FrameActivation(
@@ -631,215 +701,333 @@ def collect_activations(
             )
             all_activations.append(frame_act)
     
-    return all_activations
+    if spatial_cache_path and need_tracker and tracker is not None:
+        tracker.save(spatial_cache_path)
+    
+    return all_activations, tracker
+
+
+def _collect_metadata_covla(
+    dataloader: DataLoader,
+) -> List[Dict[str, Any]]:
+    """Collect per-sample metadata from the test dataset (CPU only)."""
+    all_metadata: List[Dict[str, Any]] = []
+    for batch in tqdm(dataloader, desc="Collecting metadata"):
+        for i in range(len(batch["video_ids"])):
+            meta = batch["metadata"][i]
+            meta_scores = {
+                f_name: meta.get(f_name, np.nan)
+                for f_name in METADATA_FIELDS + CONTEXT_FIELDS
+            }
+            all_metadata.append({
+                "video_id": batch["video_ids"][i],
+                "frame_idx": batch["frame_idxs"][i],
+                "clip_frame_indices": batch["clip_frame_indices"][i],
+                "metadata": meta_scores,
+                "rich_caption": meta.get("rich_caption", ""),
+            })
+    return all_metadata
+
+
+@torch.inference_mode()
+def collect_activations_from_val_cache(
+    sae: TopKSAE,
+    val_cache_dir: Path,
+    metadata: List[Dict[str, Any]],
+    device: torch.device,
+    spatial_cache_path: Optional[Path] = None,
+    top_k_frames: int = 10,
+) -> Tuple[List[FrameActivation], Optional[SpatialTopKTracker]]:
+    """Load pre-cached Orbis activations from WebDataset val shards and encode through SAE.
+
+    Skips the Orbis model entirely, using raw activations from the
+    sae_cache val directory created during training.
+    """
+    import io
+    import webdataset as wds
+
+    tracker = None
+
+    # Check existing spatial cache
+    if spatial_cache_path and spatial_cache_path.exists():
+        tracker = SpatialTopKTracker.load(spatial_cache_path)
+        # Still need to build FrameActivation list, but skip tracker rebuild
+
+    # Load _meta.json
+    meta_file = val_cache_dir / "_meta.json"
+    if not meta_file.exists():
+        raise FileNotFoundError(f"Val cache metadata not found: {meta_file}")
+
+    import json as json_module
+    with meta_file.open("r") as f:
+        cache_meta = json_module.load(f)
+
+    num_cache_files = cache_meta["num_files"]
+    total_tokens = cache_meta["total_tokens"]
+    hidden_dim = cache_meta["hidden_dim"]
+    cache_batch_size = cache_meta.get("batch_size", 4)
+
+    # Verify sample count
+    expected_samples = num_cache_files * cache_batch_size
+    mismatch = abs(expected_samples - len(metadata))
+    if mismatch > cache_batch_size:
+        raise ValueError(
+            f"Sample count mismatch too large: cache has {num_cache_files} files x "
+            f"{cache_batch_size} samples = {expected_samples}, "
+            f"but metadata has {len(metadata)} samples (diff={mismatch}). "
+            f"The val cache was likely created from a different dataset split."
+        )
+    elif mismatch > 0:
+        logger.info(
+            f"Sample count near-match: cache={expected_samples}, metadata={len(metadata)} "
+            f"(diff={mismatch}, last batch may be partial)"
+        )
+
+    logger.info(
+        f"Loading val cache from {val_cache_dir}: "
+        f"{num_cache_files} files, {total_tokens:,} tokens, "
+        f"hidden_dim={hidden_dim}, batch_size={cache_batch_size}"
+    )
+
+    # Custom pt decoder
+    def _pt_decoder(data: bytes) -> torch.Tensor:
+        stream = io.BytesIO(data)
+        loaded = torch.load(stream, weights_only=True, map_location="cpu")
+        if isinstance(loaded, dict) and "activations" in loaded:
+            return loaded["activations"]
+        return loaded
+
+    # Load shards sequentially
+    shard_pattern = sorted(val_cache_dir.glob("*.tar"))
+    if not shard_pattern:
+        raise FileNotFoundError(f"No .tar shards found in {val_cache_dir}")
+
+    dataset = wds.WebDataset(
+        [str(p) for p in shard_pattern],
+        shardshuffle=0,
+        empty_check=False,
+    ).decode(wds.handle_extension("pt", _pt_decoder)).to_tuple("pt")
+
+    d_sae = sae.config.d_sae
+    num_spatial = ORBIS_GRID_H * ORBIS_GRID_W
+    need_tracker = tracker is None
+    if need_tracker:
+        tracker = SpatialTopKTracker(num_latents=d_sae, top_k=top_k_frames)
+
+    all_activations: List[FrameActivation] = []
+    sample_idx = 0
+
+    for (acts_flat,) in tqdm(dataset, desc="Encoding cached activations", total=num_cache_files):
+        acts_flat = acts_flat.to(device).float()
+
+        tokens_per_sample = acts_flat.shape[0] // cache_batch_size
+        actual_batch_size = acts_flat.shape[0] // tokens_per_sample
+        acts_batched = acts_flat.view(actual_batch_size, tokens_per_sample, hidden_dim)
+
+        sae_acts = sae.encode(acts_batched)
+        sae_acts_mean = sae_acts.mean(dim=1).cpu().numpy()
+
+        # Spatial tracker: target frame only
+        if need_tracker:
+            target_spatial = sae_acts[:, -num_spatial:, :].cpu().numpy()
+
+        batch_metadata = []
+        for i in range(actual_batch_size):
+            if sample_idx + i >= len(metadata):
+                break
+            meta = metadata[sample_idx + i]
+            batch_metadata.append({
+                "video_id": meta["video_id"],
+                "frame_idx": meta["frame_idx"],
+                "clip_frame_indices": meta["clip_frame_indices"],
+                "metadata": meta["metadata"],
+            })
+
+        if need_tracker and batch_metadata:
+            tracker.update(
+                sae_acts_mean[:len(batch_metadata)],
+                target_spatial[:len(batch_metadata)],
+                batch_metadata,
+            )
+
+        for i in range(actual_batch_size):
+            if sample_idx >= len(metadata):
+                break
+            meta = metadata[sample_idx]
+            all_activations.append(FrameActivation(
+                video_id=meta["video_id"],
+                frame_idx=meta["frame_idx"],
+                latent_activations=sae_acts_mean[i],
+                metadata=meta["metadata"],
+                rich_caption=meta.get("rich_caption", ""),
+            ))
+            sample_idx += 1
+
+    logger.info(f"Encoded {len(all_activations)} samples from val cache")
+
+    if spatial_cache_path and need_tracker and tracker is not None:
+        tracker.save(spatial_cache_path)
+
+    return all_activations, tracker
+
+
+def _build_matrices(
+    activations: List[FrameActivation],
+) -> Tuple[np.ndarray, np.ndarray, List[dict]]:
+    """Build matrix representations from CoVLA FrameActivation list."""
+    latent_matrix = np.stack([a.latent_activations for a in activations], axis=0)
+    field_matrix = np.array([
+        [a.metadata.get(f, np.nan) for f in METADATA_FIELDS]
+        for a in activations
+    ])
+    sample_metadata = [
+        {
+            "video_id": a.video_id,
+            "frame_idx": a.frame_idx,
+            "rich_caption": a.rich_caption,
+            "metadata": a.metadata,
+        }
+        for a in activations
+    ]
+    return latent_matrix, field_matrix, sample_metadata
 
 
 def compute_correlations(
     activations: List[FrameActivation],
     min_samples: int = 100,
 ) -> Dict[str, List[CorrelationResult]]:
-    """
-    Compute Pearson correlation between each latent and each metadata field.
-    
-    Returns dict mapping field_name to list of CorrelationResults (sorted by |r|).
-    """
-    num_latents = activations[0].latent_activations.shape[0]
-    num_samples = len(activations)
-    
-    logger.info(f" Computing correlations for {num_latents} latents across {num_samples} samples")
-    
-    # Build arrays for vectorized computation
-    # latent_matrix: (num_samples, num_latents)
-    latent_matrix = np.stack([a.latent_activations for a in activations], axis=0)
-    
-    # metadata_matrix: (num_samples, num_fields)
-    metadata_matrix = np.array([
-        [a.metadata.get(field, np.nan) for field in METADATA_FIELDS]
-        for a in activations
-    ])
-    
-    results: Dict[str, List[CorrelationResult]] = {field: [] for field in METADATA_FIELDS}
-    
-    for field_idx, field_name in enumerate(tqdm(METADATA_FIELDS, desc="Computing correlations")):
-        field_values = metadata_matrix[:, field_idx]
-        
-        # Filter out NaN values
-        valid_mask = ~np.isnan(field_values)
-        if valid_mask.sum() < min_samples:
-            logger.info(f"  Warning: {field_name} has only {valid_mask.sum()} valid samples")
-            continue
-        
-        valid_field = field_values[valid_mask]
-        valid_latents = latent_matrix[valid_mask]
-        
-        # Compute correlation for each latent
-        for latent_idx in range(num_latents):
-            latent_values = valid_latents[:, latent_idx]
-            
-            # Skip if latent has no variance
-            if np.std(latent_values) < 1e-8:
-                continue
-            
-            r, p = stats.pearsonr(latent_values, valid_field)
-            
-            results[field_name].append(CorrelationResult(
-                latent_idx=latent_idx,
-                field_name=field_name,
-                pearson_r=r,
-                p_value=p,
-                num_samples=int(valid_mask.sum()),
-            ))
-        
-        # Sort by absolute correlation
-        results[field_name].sort(key=lambda x: abs(x.pearson_r), reverse=True)
-    
-    return results
+    """Thin wrapper around shared compute_correlations for CoVLA FrameActivation list."""
+    latent_matrix, field_matrix, _ = _build_matrices(activations)
+    return _compute_correlations(latent_matrix, field_matrix, METADATA_FIELDS, min_samples)
 
 
-def find_pure_features(
-    correlations: Dict[str, List[CorrelationResult]],
-    high_threshold: float = 0.5,
-    low_threshold: float = 0.2,
-) -> List[PureFeature]:
-    """
-    Find 'pure features': latents with high correlation (|r| > high_threshold) 
-    with exactly one field and low correlation (|r| < low_threshold) with others.
-    """
-    # Build correlation lookup: latent_idx -> {field: r}
-    latent_correlations: Dict[int, Dict[str, float]] = {}
-    
-    for field_name, results in correlations.items():
-        for result in results:
-            if result.latent_idx not in latent_correlations:
-                latent_correlations[result.latent_idx] = {}
-            latent_correlations[result.latent_idx][field_name] = result.pearson_r
-    
-    pure_features: List[PureFeature] = []
-    
-    for latent_idx, field_corrs in latent_correlations.items():
-        # Find fields with high correlation
-        high_corr_fields = [
-            (field, r) for field, r in field_corrs.items()
-            if abs(r) >= high_threshold
-        ]
-        
-        # Check if exactly one high correlation
-        if len(high_corr_fields) != 1:
-            continue
-        
-        primary_field, primary_r = high_corr_fields[0]
-        
-        # Check all others are low
-        other_corrs = {
-            field: r for field, r in field_corrs.items()
-            if field != primary_field
-        }
-        
-        if all(abs(r) < low_threshold for r in other_corrs.values()):
-            pure_features.append(PureFeature(
-                latent_idx=latent_idx,
-                primary_field=primary_field,
-                primary_correlation=primary_r,
-                other_correlations=other_corrs,
-            ))
-    
-    # Sort by primary correlation strength
-    pure_features.sort(key=lambda x: abs(x.primary_correlation), reverse=True)
-    
-    return pure_features
-
-
-def find_top_activating_latents(
+def find_top_activating_frames(
     activations: List[FrameActivation],
-    top_n: int = 50,
-    metric: str = "max",
+    latent_idx: int,
+    top_k: int = 10,
 ) -> List[Dict[str, Any]]:
-    """
-    Find latents with the highest overall activation across all frames.
-    
-    This helps discover concepts that may not correlate with predefined metadata fields.
-    
-    Args:
-        activations: List of frame activations
-        top_n: Number of top latents to return
-        metric: How to rank latents - "max" (maximum activation) or "mean" (mean activation)
-    
-    Returns:
-        List of dicts with latent_idx, score, and statistics
-    """
-    num_latents = activations[0].latent_activations.shape[0]
-    
-    # Build latent matrix: (num_samples, num_latents)
-    latent_matrix = np.stack([a.latent_activations for a in activations], axis=0)
-    
-    # Compute score per latent
-    if metric == "max":
-        scores = np.max(latent_matrix, axis=0)
-    elif metric == "mean":
-        scores = np.mean(latent_matrix, axis=0)
-    elif metric == "std":
-        # High variance latents are often interesting
-        scores = np.std(latent_matrix, axis=0)
-    else:
-        raise ValueError(f"Unknown metric: {metric}")
-    
-    # Get top indices
-    top_indices = np.argsort(scores)[::-1][:top_n]
-    
-    results = []
-    for latent_idx in top_indices:
-        latent_acts = latent_matrix[:, latent_idx]
-        results.append({
-            "latent_idx": int(latent_idx),
-            "score": float(scores[latent_idx]),
-            "max": float(np.max(latent_acts)),
-            "mean": float(np.mean(latent_acts)),
-            "std": float(np.std(latent_acts)),
-            "sparsity": float(np.mean(latent_acts > 0)),  # fraction of frames where active
-        })
-    
+    """Thin wrapper for CoVLA -- adds rich_caption and activation_value keys."""
+    latent_matrix, _, sample_metadata = _build_matrices(activations)
+    results = _find_top_activating_frames(latent_matrix, latent_idx, sample_metadata, top_k)
+    # Add CoVLA-specific key aliases for backward compatibility with report generators
+    for r in results:
+        r["activation_value"] = r["activation"]
     return results
+
+
+def _load_frame_from_video(videos_dir: Path, video_id: str, frame_idx: int) -> Optional[np.ndarray]:
+    """Load a single frame from a CoVLA mp4 video."""
+    from decord import VideoReader, cpu
+    video_path = videos_dir / f"{video_id}.mp4"
+    if not video_path.exists():
+        return None
+    try:
+        vr = VideoReader(str(video_path), ctx=cpu(0))
+        return vr[frame_idx].asnumpy()
+    except Exception as e:
+        logger.warning(f"Could not load frame {frame_idx} from {video_path}: {e}")
+        return None
+
+
+def _load_clip_from_video(
+    videos_dir: Path, video_id: str, frame_indices: List[int],
+) -> List[np.ndarray]:
+    """Load multiple frames for a clip from a CoVLA mp4 video."""
+    from decord import VideoReader, cpu
+    video_path = videos_dir / f"{video_id}.mp4"
+    if not video_path.exists():
+        return []
+    try:
+        vr = VideoReader(str(video_path), ctx=cpu(0))
+        total = len(vr)
+        valid_indices = [min(idx, total - 1) for idx in frame_indices]
+        return [vr[idx].asnumpy() for idx in valid_indices]
+    except Exception as e:
+        logger.warning(f"Could not load clip from {video_path}: {e}")
+        return []
+
+
+def _save_covla_latent_visualizations(
+    entries: List[SpatialEntry],
+    videos_dir: Path,
+    output_dir: Path,
+    latent_idx: int,
+    captions_dir: Optional[Path] = None,
+) -> List[str]:
+    """Save clip/frame/heatmap artifacts for a CoVLA latent's top entries."""
+    saved_paths = []
+    for rank, entry in enumerate(entries):
+        prefix = f"rank{rank + 1}_{entry.video_id}_frame{entry.frame_idx}"
+
+        frame = _load_frame_from_video(videos_dir, entry.video_id, entry.frame_idx)
+        if frame is None:
+            continue
+
+        # Target frame PNG
+        frame_path = output_dir / f"{prefix}.png"
+        save_frame_png(frame, frame_path)
+        saved_paths.append(str(frame_path))
+
+        # Patch heatmap (side-by-side)
+        heatmap_path = output_dir / f"{prefix}_heatmap.png"
+        meta = entry.metadata
+        title = (
+            f"Latent {latent_idx} | rank {rank + 1} | "
+            f"act={entry.score:.3f}"
+        )
+        create_patch_heatmap(frame, entry.spatial_map, heatmap_path, title=title)
+
+        # Clip video
+        if entry.clip_frame_indices:
+            clip_frames = _load_clip_from_video(
+                videos_dir, entry.video_id, entry.clip_frame_indices,
+            )
+            if clip_frames:
+                clip_path = output_dir / f"{prefix}_clip.mp4"
+                create_clip_video(clip_frames, clip_path)
+
+    return saved_paths
 
 
 def analyze_top_latents(
     activations: List[FrameActivation],
     videos_dir: Path,
     output_dir: Path,
+    tracker: Optional[SpatialTopKTracker] = None,
     top_n_latents: int = 20,
     top_k_frames: int = 10,
     metric: str = "max",
+    captions_dir: Optional[Path] = None,
 ) -> str:
+    """Analyze top activating latents with multi-granularity visualizations.
+
+    When a spatial tracker is available, saves heatmaps and clip videos in
+    addition to frame PNGs.
     """
-    Analyze top activating latents overall (not tied to specific metadata fields).
-    
-    Saves frames and generates a report for manual inspection of learned concepts.
-    """
-    from decord import VideoReader, cpu
-    
-    logger.info(f" Finding top {top_n_latents} latents by {metric} activation...")
-    top_latents = find_top_activating_latents(activations, top_n=top_n_latents, metric=metric)
-    
-    # Create output directory
+    logger.info(f"Finding top {top_n_latents} latents by {metric} activation...")
+    latent_matrix = np.stack([a.latent_activations for a in activations], axis=0)
+    top_latents = find_top_activating_latents(latent_matrix, top_n=top_n_latents, metric=metric)
+
     top_latents_dir = output_dir / "top_latents"
     top_latents_dir.mkdir(parents=True, exist_ok=True)
-    
+
+    has_tracker = tracker is not None
+
     lines = [
         "# Top Activating Latents Analysis",
         "",
         f"**Metric:** {metric}",
-        f"**Total latents analyzed:** {activations[0].latent_activations.shape[0]}",
-        f"**Total frames:** {len(activations)}",
-        "",
-        "This report shows latents with the highest overall activation, regardless of correlation with metadata.",
-        "These may represent visual concepts not captured by the predefined metadata fields.",
+        f"**Total latents analyzed:** {latent_matrix.shape[1]}",
+        f"**Total frames:** {latent_matrix.shape[0]}",
+        f"**Visualizations:** {'heatmaps + clips' if has_tracker else 'frames only'}",
         "",
         "---",
         "",
     ]
-    
+
     for i, latent_info in enumerate(tqdm(top_latents, desc="Processing top latents")):
         latent_idx = latent_info["latent_idx"]
-        
+
         lines.extend([
             f"## #{i+1}: Latent {latent_idx}",
             "",
@@ -850,90 +1038,79 @@ def analyze_top_latents(
             f"- **Sparsity:** {latent_info['sparsity']:.2%} of frames active",
             "",
         ])
-        
-        # Find top activating frames
-        top_frames = find_top_activating_frames(activations, latent_idx, top_k_frames)
-        
-        # Save frames
-        frame_dir = top_latents_dir / f"latent_{latent_idx}"
-        frame_dir.mkdir(parents=True, exist_ok=True)
-        
-        for j, frame_info in enumerate(top_frames):
-            video_path = videos_dir / f"{frame_info['video_id']}.mp4"
-            if video_path.exists():
-                try:
-                    vr = VideoReader(str(video_path), ctx=cpu(0))
-                    frame = vr[frame_info["frame_idx"]].asnumpy()
-                    img = Image.fromarray(frame)
-                    save_path = frame_dir / f"rank{j+1}_{frame_info['video_id']}_frame{frame_info['frame_idx']}.png"
-                    img.save(save_path)
-                except Exception as e:
-                    logger.warning(f" Could not save frame: {e}")
-        
-        # Add frames and captions to report
-        lines.append("### Top Activating Frames")
-        lines.append("")
-        
-        for j, frame_info in enumerate(top_frames):
-            video_id = frame_info["video_id"]
-            frame_idx = frame_info["frame_idx"]
-            activation = frame_info["activation_value"]
-            caption = frame_info["rich_caption"] if frame_info["rich_caption"] else "*No caption*"
-            
-            img_path = f"top_latents/latent_{latent_idx}/rank{j+1}_{video_id}_frame{frame_idx}.png"
-            
-            lines.extend([
-                f"**Rank {j+1}:** `{video_id}` frame {frame_idx} (activation: {activation:.4f})",
-                f"",
-                f"![frame]({img_path})",
-                "",
-                f"> {caption}",
-                "",
-            ])
-        
-        lines.append("---")
-        lines.append("")
-    
-    # Save latent info as JSON
-    with open(output_dir / "top_latents.json", 'w') as f:
+
+        latent_dir = top_latents_dir / f"latent_{latent_idx}"
+        latent_dir.mkdir(parents=True, exist_ok=True)
+
+        if has_tracker:
+            entries = tracker.get_top_k(latent_idx)[:top_k_frames]
+            _save_covla_latent_visualizations(
+                entries, videos_dir, latent_dir, latent_idx, captions_dir,
+            )
+
+            lines.append("### Top Activating Clips")
+            lines.append("")
+            for rank, entry in enumerate(entries):
+                vid = entry.video_id
+                fidx = entry.frame_idx
+                prefix = f"rank{rank + 1}_{vid}_frame{fidx}"
+                img_rel = f"top_latents/latent_{latent_idx}/{prefix}.png"
+                heatmap_rel = f"top_latents/latent_{latent_idx}/{prefix}_heatmap.png"
+
+                # Try to load caption
+                caption = ""
+                if captions_dir:
+                    meta_data = load_frame_metadata(captions_dir, vid, fidx)
+                    caption = meta_data.get("rich_caption", "")
+
+                lines.extend([
+                    f"**Rank {rank + 1}:** `{vid}` frame {fidx} (activation: {entry.score:.4f})",
+                    "",
+                    f"![frame]({img_rel})",
+                    "",
+                    f"![heatmap]({heatmap_rel})",
+                    "",
+                ])
+                if caption:
+                    lines.extend([f"> {caption}", ""])
+        else:
+            # Fallback: frame-only visualization
+            top_frames = find_top_activating_frames(activations, latent_idx, top_k_frames)
+            for j, frame_info in enumerate(top_frames):
+                frame = _load_frame_from_video(videos_dir, frame_info["video_id"], frame_info["frame_idx"])
+                if frame is not None:
+                    save_path = latent_dir / f"rank{j+1}_{frame_info['video_id']}_frame{frame_info['frame_idx']}.png"
+                    save_frame_png(frame, save_path)
+
+            lines.append("### Top Activating Frames")
+            lines.append("")
+            for j, frame_info in enumerate(top_frames):
+                video_id = frame_info["video_id"]
+                frame_idx = frame_info["frame_idx"]
+                activation = frame_info["activation_value"]
+                caption = frame_info["rich_caption"] if frame_info["rich_caption"] else "*No caption*"
+                img_path = f"top_latents/latent_{latent_idx}/rank{j+1}_{video_id}_frame{frame_idx}.png"
+                lines.extend([
+                    f"**Rank {j+1}:** `{video_id}` frame {frame_idx} (activation: {activation:.4f})",
+                    "",
+                    f"![frame]({img_path})",
+                    "",
+                    f"> {caption}",
+                    "",
+                ])
+
+        lines.extend(["---", ""])
+
+    with open(output_dir / "top_latents.json", "w") as f:
         json.dump(top_latents, f, indent=2)
-    
+
     report = "\n".join(lines)
-    
-    # Save report
     report_path = output_dir / "top_latents_analysis.md"
-    with open(report_path, 'w') as f:
+    with open(report_path, "w") as f:
         f.write(report)
-    
-    logger.info(f"report] Top latents analysis saved to {report_path}")
-    
+
+    logger.info(f"Top latents analysis saved to {report_path}")
     return report
-
-
-def find_top_activating_frames(
-    activations: List[FrameActivation],
-    latent_idx: int,
-    top_k: int = 10,
-) -> List[Dict[str, Any]]:
-    """Find top-K frames that most strongly activate a given latent."""
-    # Sort by activation value for this latent
-    sorted_acts = sorted(
-        activations,
-        key=lambda x: x.latent_activations[latent_idx],
-        reverse=True,
-    )
-    
-    top_frames = []
-    for act in sorted_acts[:top_k]:
-        top_frames.append({
-            "video_id": act.video_id,
-            "frame_idx": act.frame_idx,
-            "activation_value": float(act.latent_activations[latent_idx]),
-            "rich_caption": act.rich_caption,
-            "metadata": act.metadata,
-        })
-    
-    return top_frames
 
 
 def save_top_frames(
@@ -942,32 +1119,30 @@ def save_top_frames(
     output_dir: Path,
     latent_idx: int,
     field_name: str,
+    tracker: Optional[SpatialTopKTracker] = None,
+    top_k_frames: int = 10,
 ) -> List[str]:
-    """Save images of top-activating frames."""
-    from decord import VideoReader, cpu
-    
+    """Save images (and optionally heatmaps/clips) of top-activating frames."""
     frame_dir = output_dir / "frames" / f"latent_{latent_idx}_{field_name}"
     frame_dir.mkdir(parents=True, exist_ok=True)
-    
+
+    # If tracker available, use it for full visualization
+    if tracker is not None:
+        entries = tracker.get_top_k(latent_idx)[:top_k_frames]
+        if entries:
+            return _save_covla_latent_visualizations(
+                entries, videos_dir, frame_dir, latent_idx,
+            )
+
+    # Fallback: frame-only
     saved_paths = []
-    
     for i, frame_info in enumerate(top_frames):
-        video_path = videos_dir / f"{frame_info['video_id']}.mp4"
-        
-        if not video_path.exists():
-            continue
-        
-        try:
-            vr = VideoReader(str(video_path), ctx=cpu(0))
-            frame = vr[frame_info["frame_idx"]].asnumpy()
-            img = Image.fromarray(frame)
-            
+        frame = _load_frame_from_video(videos_dir, frame_info["video_id"], frame_info["frame_idx"])
+        if frame is not None:
             save_path = frame_dir / f"rank{i+1}_{frame_info['video_id']}_frame{frame_info['frame_idx']}.png"
-            img.save(save_path)
+            save_frame_png(frame, save_path)
             saved_paths.append(str(save_path))
-        except Exception as e:
-            logger.warning(f" Could not save frame: {e}")
-    
+
     return saved_paths
 
 
@@ -979,8 +1154,9 @@ def generate_report(
     output_dir: Path,
     top_k: int = 10,
     top_latents_per_field: int = 3,
+    tracker: Optional[SpatialTopKTracker] = None,
 ) -> str:
-    """Generate comprehensive analysis report."""
+    """Generate comprehensive analysis report with optional multi-granularity visualizations."""
     
     report_lines = [
         "=" * 80,
@@ -989,10 +1165,10 @@ def generate_report(
         "",
         f"Total frames analyzed: {len(activations)}",
         f"Number of latents: {activations[0].latent_activations.shape[0]}",
+        f"Visualizations: {'heatmaps + clips' if tracker else 'frames only'}",
         "",
     ]
     
-    # Per-field analysis
     for field_name in METADATA_FIELDS:
         report_lines.extend([
             "",
@@ -1016,18 +1192,16 @@ def generate_report(
                 f"      N = {result.num_samples}",
             ])
             
-            # Find top activating frames for this latent
             top_frames = find_top_activating_frames(activations, result.latent_idx, top_k)
             
-            # Save frames
             saved_paths = save_top_frames(
                 top_frames, videos_dir, output_dir,
                 result.latent_idx, field_name,
+                tracker=tracker, top_k_frames=top_k,
             )
             
             report_lines.append(f"      Top {top_k} activating frames saved to: {saved_paths[0] if saved_paths else 'N/A'}")
             
-            # Show top 3 captions
             report_lines.append("      Top activating frame captions:")
             for j, frame in enumerate(top_frames[:3]):
                 caption = frame["rich_caption"][:100] + "..." if len(frame["rich_caption"]) > 100 else frame["rich_caption"]
@@ -1042,8 +1216,7 @@ def generate_report(
         f"\nFound {len(pure_features)} pure features",
     ])
     
-    # Group by primary field
-    by_field: Dict[str, List[PureFeature]] = {field: [] for field in METADATA_FIELDS}
+    by_field: Dict[str, List[PureFeature]] = {f: [] for f in METADATA_FIELDS}
     for pf in pure_features:
         by_field[pf.primary_field].append(pf)
     
@@ -1057,12 +1230,11 @@ def generate_report(
     
     report = "\n".join(report_lines)
     
-    # Save report
     report_path = output_dir / "semantic_grounding_report.txt"
-    with open(report_path, 'w') as f:
+    with open(report_path, "w") as f:
         f.write(report)
     
-    logger.info(f"report] Saved to {report_path}")
+    logger.info(f"Saved report to {report_path}")
     
     return report
 
@@ -1153,7 +1325,7 @@ def generate_detailed_frame_analysis(
     with open(report_path, 'w') as f:
         f.write(report)
     
-    logger.info(f"report] Detailed frame analysis saved to {report_path}")
+    logger.info(f"Detailed frame analysis saved to {report_path}")
     
     return report
 
@@ -1162,37 +1334,48 @@ def main(args: argparse.Namespace):
     """Main analysis function."""
     
     device = torch.device(args.device)
-    logger.info(f" Using device: {device}")
+    logger.info(f"Using device: {device}")
     
     exp_dir = Path(args.exp_dir)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Load models
-    logger.info("Loading Orbis model...")
-    config_path = exp_dir / args.config
-    ckpt_path = exp_dir / args.ckpt
-    orbis_model = load_orbis_model(config_path, ckpt_path, device)
-    
+    # Load SAE (always needed)
     logger.info("Loading SAE...")
     sae = load_sae(Path(args.sae_checkpoint), device)
-    logger.info(f"  SAE config: d_in={sae.config.d_in}, d_sae={sae.config.d_sae}, k={sae.config.k}")
+    logger.info(f"SAE config: d_in={sae.config.d_in}, d_sae={sae.config.d_sae}, k={sae.config.k}")
     
-    # Create test dataset
-    logger.info("Creating test dataset...")
-    test_dataset = TestDataset(
-        videos_dir=args.test_videos_dir,
-        captions_dir=args.test_captions_dir,
-        split_file=args.split_file,
-        size=tuple(args.input_size),
-        target_frame_rate=args.frame_rate,
-        stored_frame_rate=args.stored_frame_rate,
-        num_frames=args.num_frames,  # Context window to match training
-        max_videos=args.max_videos,
-    )
+    # Create dataset
+    if args.use_val_split:
+        # Val split mode: same split as SAE training (compatible with val cache)
+        logger.info("Creating val dataset (same split as SAE training)...")
+        val_subset, full_dataset = create_val_dataset_covla(
+            videos_dir=args.test_videos_dir,
+            captions_dir=args.test_captions_dir,
+            input_size=tuple(args.input_size),
+            num_frames=args.num_frames,
+            stored_frame_rate=args.stored_frame_rate,
+            frame_rate=args.frame_rate,
+            num_videos=args.num_videos,
+            val_split=args.val_split,
+        )
+        analysis_dataset: Dataset = CoVLAValWrapper(val_subset, full_dataset, args.test_captions_dir)
+    else:
+        # Test split mode: use separate test set via split file
+        logger.info("Creating test dataset...")
+        analysis_dataset = TestDataset(
+            videos_dir=args.test_videos_dir,
+            captions_dir=args.test_captions_dir,
+            split_file=args.split_file,
+            size=tuple(args.input_size),
+            target_frame_rate=args.frame_rate,
+            stored_frame_rate=args.stored_frame_rate,
+            num_frames=args.num_frames,
+            max_videos=args.max_videos,
+        )
     
     test_loader = DataLoader(
-        test_dataset,
+        analysis_dataset,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
@@ -1200,28 +1383,54 @@ def main(args: argparse.Namespace):
         pin_memory=True,
     )
     
-    # Determine cache directory (same location as train/val caches)
-    cache_dir = None
-    if not args.no_cache:
-        cache_dir = get_test_cache_dir(
-            exp_dir=exp_dir,
-            data_source="covla",  # TODO: make this configurable if needed
-            layer_idx=args.layer,
-        )
-        logger.info(f" Test activation cache directory: {cache_dir}")
+    # Spatial cache for heatmap/clip visualization
+    spatial_cache_path = output_dir / "spatial_topk_cache.pt" if not args.no_cache else None
+    if args.rebuild_cache and spatial_cache_path and spatial_cache_path.exists():
+        spatial_cache_path.unlink()
     
-    # Collect activations (with caching)
-    logger.info("Collecting SAE activations...")
-    activations = collect_activations(
-        orbis_model=orbis_model,
-        sae=sae,
-        dataloader=test_loader,
-        layer_idx=args.layer,
-        device=device,
-        frame_rate=args.frame_rate,
-        cache_dir=cache_dir,
-        rebuild_cache=args.rebuild_cache,
-    )
+    # Collect activations + spatial top-K
+    if args.val_cache_dir:
+        # Fast path: load pre-cached Orbis activations from WDS shards
+        val_cache_dir = Path(args.val_cache_dir)
+        logger.info(f"Using pre-cached val activations from {val_cache_dir}")
+        metadata = _collect_metadata_covla(test_loader)
+        activations, tracker = collect_activations_from_val_cache(
+            sae=sae,
+            val_cache_dir=val_cache_dir,
+            metadata=metadata,
+            device=device,
+            spatial_cache_path=spatial_cache_path,
+            top_k_frames=args.top_k,
+        )
+    else:
+        # Standard path: run Orbis forward passes
+        logger.info("Loading Orbis model...")
+        config_path = exp_dir / args.config
+        ckpt_path = exp_dir / args.ckpt
+        orbis_model = load_orbis_model(config_path, ckpt_path, device)
+        
+        cache_dir = None
+        if not args.no_cache:
+            cache_dir = get_test_cache_dir(
+                exp_dir=exp_dir,
+                data_source="covla",
+                layer_idx=args.layer,
+            )
+            logger.info(f"Test activation cache directory: {cache_dir}")
+        
+        logger.info("Collecting SAE activations...")
+        activations, tracker = collect_activations(
+            orbis_model=orbis_model,
+            sae=sae,
+            dataloader=test_loader,
+            layer_idx=args.layer,
+            device=device,
+            frame_rate=args.frame_rate,
+            cache_dir=cache_dir,
+            rebuild_cache=args.rebuild_cache,
+            spatial_cache_path=spatial_cache_path,
+            top_k_frames=args.top_k,
+        )
     
     # Compute correlations
     logger.info("Computing correlations...")
@@ -1231,25 +1440,25 @@ def main(args: argparse.Namespace):
     logger.info("Finding pure features...")
     pure_features = find_pure_features(
         correlations,
-        high_threshold=args.high_threshold,
-        low_threshold=args.low_threshold,
+        primary_threshold=args.high_threshold,
+        secondary_threshold=args.low_threshold,
     )
-    logger.info(f"  Found {len(pure_features)} pure features")
+    logger.info(f"Found {len(pure_features)} pure features")
     
     # Save correlation data
     corr_data = {
-        field: [asdict(r) for r in results]
-        for field, results in correlations.items()
+        f: [asdict(r) for r in results]
+        for f, results in correlations.items()
     }
-    with open(output_dir / "correlations.json", 'w') as f:
+    with open(output_dir / "correlations.json", "w") as f:
         json.dump(corr_data, f, indent=2)
     
     # Save pure features
     pure_data = [asdict(pf) for pf in pure_features]
-    with open(output_dir / "pure_features.json", 'w') as f:
-        json.dump(pure_data, f, indent=2, default=lambda x: x.tolist() if hasattr(x, 'tolist') else x)
+    with open(output_dir / "pure_features.json", "w") as f:
+        json.dump(pure_data, f, indent=2, default=lambda x: x.tolist() if hasattr(x, "tolist") else x)
     
-    # Generate report
+    # Generate report (with optional heatmaps/clips)
     logger.info("Generating report...")
     report = generate_report(
         correlations=correlations,
@@ -1259,8 +1468,8 @@ def main(args: argparse.Namespace):
         output_dir=output_dir,
         top_k=args.top_k,
         top_latents_per_field=args.top_latents_per_field,
+        tracker=tracker,
     )
-    
     logger.info(f"\n{report}")
     
     # Generate detailed frame analysis with full captions
@@ -1273,18 +1482,20 @@ def main(args: argparse.Namespace):
         top_latents_per_field=args.top_latents_per_field,
     )
     
-    # Analyze top activating latents overall (not tied to metadata)
+    # Analyze top activating latents (with optional heatmaps/clips)
     logger.info("Analyzing top activating latents...")
     analyze_top_latents(
         activations=activations,
         videos_dir=Path(args.test_videos_dir),
         output_dir=output_dir,
+        tracker=tracker,
         top_n_latents=args.top_n_latents,
         top_k_frames=args.top_k,
         metric=args.latent_metric,
+        captions_dir=Path(args.test_captions_dir),
     )
     
-    logger.info(f"done] Analysis complete. Results saved to {output_dir}")
+    logger.info(f"Analysis complete. Results saved to {output_dir}")
 
 
 def generate_report_from_saved(
@@ -1399,7 +1610,7 @@ def generate_report_from_saved(
     with open(report_path, 'w') as f:
         f.write(report)
     
-    logger.info(f"report] Detailed frame analysis saved to {report_path}")
+    logger.info(f"Detailed frame analysis saved to {report_path}")
     
     return report
 
@@ -1475,6 +1686,18 @@ if __name__ == "__main__":
                         help="Disable Orbis activation caching (always recompute)")
     parser.add_argument("--rebuild_cache", action="store_true",
                         help="Force rebuild of Orbis activation cache even if it exists")
+    parser.add_argument("--val_cache_dir", type=str, default=None,
+                        help="Path to pre-cached val activations (sae_cache WDS shards). "
+                        "Skips Orbis model loading when provided.")
+    
+    # Val split mode: use the same val set as SAE training (compatible with val cache)
+    parser.add_argument("--use_val_split", action="store_true",
+                        help="Use the SAE training val split (last 10%% of videos by sorted order) "
+                        "instead of a test split file. Compatible with --val_cache_dir.")
+    parser.add_argument("--num_videos", type=int, default=3000,
+                        help="Total number of videos (must match training config for correct split)")
+    parser.add_argument("--val_split", type=float, default=0.1,
+                        help="Val split fraction (must match training config)")
     
     args = parser.parse_args()
     

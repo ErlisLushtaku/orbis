@@ -44,10 +44,6 @@ from sae.calibrate_batch_size.core import (
 logger = logging.getLogger(__name__)
 
 
-# =============================================================================
-# Orbis OOM Testing
-# =============================================================================
-
 def orbis_causes_oom(
     model: nn.Module,
     input_size: Tuple[int, int],
@@ -231,10 +227,6 @@ def calibrate_orbis_batch_size(
     )
 
 
-# =============================================================================
-# Resource Path Management
-# =============================================================================
-
 def get_orbis_resource_dir(
     layer: int,
     model_name: str = DEFAULT_MODEL_NAME,
@@ -316,10 +308,6 @@ def create_orbis_resource_data(
         "calibrated_at": date.today().isoformat(),
     }
 
-
-# =============================================================================
-# CLI Entry Point
-# =============================================================================
 
 def _load_orbis_model(
     config_path: str,
@@ -421,7 +409,7 @@ def _parse_args() -> argparse.Namespace:
 def main() -> int:
     """CLI entry point for Orbis caching batch size calibration."""
     from sae.calibrate_batch_size.runner import run_calibration
-    from sae.utils.logging_utils import get_logger, setup_sae_logging
+    from sae.utils.logging import get_logger, setup_sae_logging
     
     args = _parse_args()
     setup_sae_logging(level="INFO")
