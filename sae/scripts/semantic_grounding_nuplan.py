@@ -52,7 +52,7 @@ from sae.utils.constants import ORBIS_GRID_H, ORBIS_GRID_W
 from sae.utils.logging import get_logger, setup_sae_logging
 from sae.utils.model_loading import load_orbis_model, load_sae
 from sae.utils.spatial_tracker import SpatialEntry, SpatialTopKTracker
-from sae.utils.viz import create_clip_video, create_patch_heatmap, save_frame_png
+from sae.utils.viz import create_clip_video, create_overlay_heatmap, save_frame_png
 from data.nuplan.nuplan_dataset import NuPlanOrbisMultiFrame
 
 # Setup logging
@@ -613,14 +613,14 @@ def _save_latent_visualizations(
         save_frame_png(frame_rgb, frame_path)
         saved_paths.append(str(frame_path))
 
-        # Patch heatmap (side-by-side)
+        # Overlay heatmap
         heatmap_path = output_dir / f"{prefix}_heatmap.png"
         title = (
             f"Latent {latent_idx} | rank {rank + 1} | "
             f"act={entry.score:.3f} | "
             f"speed={entry.metadata.get('target_speed_kmh', 0):.1f} km/h"
         )
-        create_patch_heatmap(frame_rgb, entry.spatial_map, heatmap_path, title=title)
+        create_overlay_heatmap(frame_rgb, entry.spatial_map, heatmap_path, title=title)
 
         # Clip video
         if entry.clip_frame_indices:
