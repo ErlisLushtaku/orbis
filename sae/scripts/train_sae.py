@@ -926,12 +926,14 @@ def _create_sae_and_trainer(
     total_training_steps: int = 0,
 ) -> Tuple[TopKSAE, TopKSAETrainer, TopKSAEConfig]:
     """Instantiate SAE model and trainer."""
+    decoder_init_norm = args.decoder_init_norm if args.decoder_init_norm > 0 else None
     sae_config = TopKSAEConfig(
         d_in=hidden_size,
         expansion_factor=args.expansion_factor,
         k=args.k,
         dead_feature_window=args.dead_feature_window,
         aux_loss_coefficient=args.aux_loss_coefficient,
+        decoder_init_norm=decoder_init_norm,
         normalize_activations=args.normalize_activations,
         b_dec_init_method=args.b_dec_init,
     )
@@ -990,6 +992,8 @@ def _save_experiment_config(
             "k": sae_config.k,
             "aux_loss_coefficient": sae_config.aux_loss_coefficient,
             "dead_feature_window": sae_config.dead_feature_window,
+            "decoder_init_norm": sae_config.decoder_init_norm,
+            "rescale_acts_by_decoder_norm": sae_config.rescale_acts_by_decoder_norm,
             "normalize_activations": sae_config.normalize_activations,
             "b_dec_init_method": sae_config.b_dec_init_method,
         },
@@ -1769,8 +1773,11 @@ def parse_args(argv=None):
     parser.add_argument("--aux_loss_coefficient", type=float, default=1.0,
                         help="Coefficient for auxiliary TopK loss (dead-feature revival). "
                              "Set to 0 to disable. Default: 1.0 (from Gao et al.)")
-    parser.add_argument("--dead_feature_window", type=int, default=5000,
+    parser.add_argument("--dead_feature_window", type=int, default=1000,
                         help="Steps without firing before a feature is considered dead")
+    parser.add_argument("--decoder_init_norm", type=float, default=0.1,
+                        help="Normalize decoder rows to this norm at init (0.1 from Anthropic). "
+                             "Set to 0 to disable.")
     parser.add_argument("--b_dec_init", type=str, default="geometric_median",
                         choices=["geometric_median", "mean", "zeros"],
                         help="Method for initializing decoder bias")

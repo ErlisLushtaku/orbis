@@ -81,14 +81,12 @@ def sae_causes_oom(
             optimizer.zero_grad()
             
             # Forward pass (fp32, matching real training)
-            model.set_decoder_norm_to_unit_norm()
             reconstruction, sparse_acts, loss, _, _ = model(batch)
             
             # Backward pass (allocates gradient buffers)
             loss.backward()
             
             # Optimizer step (allocates optimizer state: momentum, variance)
-            model.remove_gradient_parallel_to_decoder_directions()
             optimizer.step()
             
             # Clean up iteration tensors

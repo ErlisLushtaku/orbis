@@ -124,8 +124,8 @@ def test_forward_backward():
 
 
 def test_decoder_normalization():
-    """Test decoder weight normalization (SAEBench Standard)."""
-    print("[test] Testing decoder normalization...")
+    """Test decoder initialization and fold_W_dec_norm."""
+    print("[test] Testing decoder initialization and fold_W_dec_norm...")
     
     try:
         import torch
@@ -134,41 +134,47 @@ def test_decoder_normalization():
         config = TopKSAEConfig(d_in=768, expansion_factor=16, k=64)
         sae = TopKSAE(config)
         
-        # 1. Initial Check (Initialization should be normalized)
+        # 1. Check init: decoder rows should have decoder_init_norm (0.1)
         norms = torch.norm(sae.W_dec, dim=1)
-        target = torch.ones_like(norms)
+        target_norm = config.decoder_init_norm
+        target = torch.full_like(norms, target_norm)
         max_diff = torch.max(torch.abs(norms - target)).item()
         
-        print(f"       [Init] Max deviation from Unit Norm: {max_diff:.9f}")
+        print(f"       [Init] Max deviation from {target_norm} norm: {max_diff:.9f}")
+        assert max_diff < 1e-5, f"Init norms wrong! Max diff: {max_diff}"
+        print(f"  [OK] Initial decoder norms = {target_norm}")
         
-        if max_diff > 1e-5:
-             print(f"  [FAIL] Initial norms are not unit length! Max diff: {max_diff}")
-             return False
-        print("  [OK] Initial normalization correct")
+        # 2. Check tied init: W_enc should be W_dec.T
+        assert torch.allclose(sae.W_enc.data, sae.W_dec.data.T, atol=1e-6), \
+            "W_enc should be W_dec.T after initialization"
+        print("  [OK] W_enc = W_dec.T (tied initialization)")
         
-        # 2. Perturbation Test
-        print("       [Step] Doubling weights to break normalization...")
-        with torch.no_grad():
-            sae.W_dec.data *= 2.0
+        # 3. Test fold_W_dec_norm: forward pass should be unchanged
+        x = torch.randn(8, 768)
+        out_before, _, _, _, _ = sae(x)
         
-        bad_norms = torch.norm(sae.W_dec, dim=1)
-        assert torch.all(bad_norms > 1.5), "Weights didn't change!"
+        sae.fold_W_dec_norm()
         
-        # 3. Restoration Test
-        sae.set_decoder_norm_to_unit_norm()
+        # After folding, decoder rows should be unit-norm
+        folded_norms = torch.norm(sae.W_dec, dim=1)
+        unit_target = torch.ones_like(folded_norms)
+        max_diff_folded = torch.max(torch.abs(folded_norms - unit_target)).item()
+        assert max_diff_folded < 1e-5, f"Folded norms not unit! Max diff: {max_diff_folded}"
+        print(f"  [OK] fold_W_dec_norm produces unit-norm decoder rows")
         
-        new_norms = torch.norm(sae.W_dec, dim=1)
-        max_diff_after = torch.max(torch.abs(new_norms - target)).item()
-        
-        print(f"       [Post-Norm] Max deviation from Unit Norm: {max_diff_after:.9f}")
-        
-        assert torch.allclose(new_norms, target, atol=1e-5), \
-            f"Decoder weights not normalized after set_decoder_norm_to_unit_norm(). Max diff: {max_diff_after}"
-        print(f"  [OK] Normalization function works correctly")
+        # Forward pass after folding should give same result
+        # (need to disable rescaling since norms are now folded)
+        sae.config.rescale_acts_by_decoder_norm = False
+        out_after, _, _, _, _ = sae(x)
+        assert torch.allclose(out_before, out_after, atol=1e-4), \
+            f"Forward pass changed after fold_W_dec_norm! Max diff: {(out_before - out_after).abs().max().item()}"
+        print("  [OK] Forward pass unchanged after fold_W_dec_norm")
         
         return True
     except Exception as e:
         print(f"  [FAIL] Error: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 

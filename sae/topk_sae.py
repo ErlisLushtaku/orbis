@@ -1,15 +1,14 @@
 """
 Top-K Sparse Autoencoder for Orbis world model activations.
 
-Training recipe combines ViT-Prisma's infrastructure (normalized MSE, gradient
-orthogonalization, geometric median init, cosine warmup scheduler, fp32) with
-the auxiliary TopK loss from SAELens/OpenAI (Gao et al., "Scaling and Evaluating
-Sparse Autoencoders") for dead-feature revival.
-
-Ghost gradients (ViT-Prisma style) are ineffective for TopK SAEs because dead
-features must compete in a hard top-k selection against well-optimized alive
-features. The auxiliary loss sidesteps this by giving dead features their own
-separate top-k selection over the residual.
+Training recipe based on SAELens/OpenAI (Gao et al., "Scaling and Evaluating
+Sparse Autoencoders"):
+- Tied encoder-decoder initialization (W_enc = W_dec.T) with small decoder norms
+- rescale_acts_by_decoder_norm: top-k selection invariant to decoder row norms
+- Standard MSE loss (sum over features, mean over batch)
+- Auxiliary TopK loss for dead-feature revival
+- Cosine annealing with warmup LR schedule, fp32, Adam optimizer
+- Geometric median b_dec initialization
 """
 
 import time
@@ -36,8 +35,10 @@ class TopKSAEConfig:
     expansion_factor: int = 16
     k: int = 64
 
-    dead_feature_window: int = 5000
+    dead_feature_window: int = 1000
     aux_loss_coefficient: float = 1.0
+    decoder_init_norm: Optional[float] = 0.1
+    rescale_acts_by_decoder_norm: bool = True
     normalize_activations: str = "none"  # "none" or "layer_norm"
     b_dec_init_method: str = "geometric_median"  # "geometric_median", "mean", "zeros"
 
@@ -55,11 +56,18 @@ class TopKSAE(nn.Module):
 
     Architecture:
         Encoder: Linear(d_in -> d_sae) + ReLU + Top-K selection
-        Decoder: Linear(d_sae -> d_in) with unit-norm rows
+        Decoder: Linear(d_sae -> d_in)
 
-    Loss: normalized MSE + auxiliary TopK loss for dead features.
-    Decoder rows are kept at unit norm before each forward pass; gradients
-    parallel to decoder directions are removed after backward.
+    Initialization (from Anthropic April 2024 / SAELens):
+        W_dec: Kaiming uniform, rows normalized to decoder_init_norm (default 0.1)
+        W_enc: W_dec.T (tied initialization)
+        b_enc, b_dec: zeros (b_dec later set via geometric median)
+
+    When rescale_acts_by_decoder_norm=True, top-k selection is invariant to
+    decoder row norms without explicit per-step normalization or gradient
+    orthogonalization. Norms can be folded post-training via fold_W_dec_norm.
+
+    Loss: standard MSE + auxiliary TopK loss for dead features.
     """
 
     def __init__(self, config: TopKSAEConfig):
@@ -77,12 +85,17 @@ class TopKSAE(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        nn.init.kaiming_uniform_(self.W_enc, a=0, mode="fan_in", nonlinearity="relu")
-        nn.init.normal_(self.W_dec, mean=0, std=1.0 / self.d_in**0.5)
-        self.set_decoder_norm_to_unit_norm()
+        # W_dec: Kaiming uniform, then normalize rows to decoder_init_norm
+        nn.init.kaiming_uniform_(self.W_dec)
+        if self.config.decoder_init_norm is not None:
+            with torch.no_grad():
+                self.W_dec.data /= self.W_dec.data.norm(dim=-1, keepdim=True)
+                self.W_dec.data *= self.config.decoder_init_norm
+        # W_enc: tied to W_dec.T (encoder-decoder start in same subspace)
+        self.W_enc.data = self.W_dec.data.T.clone().detach().contiguous()
 
     # ------------------------------------------------------------------
-    # Decoder norm management
+    # Decoder norm utilities (for checkpoint conversion / inference)
     # ------------------------------------------------------------------
 
     @torch.no_grad()
@@ -97,6 +110,26 @@ class TopKSAE(nn.Module):
             return
         parallel_component = (self.W_dec.grad * self.W_dec.data).sum(dim=1, keepdim=True)
         self.W_dec.grad -= parallel_component * self.W_dec.data
+
+    @torch.no_grad()
+    def fold_W_dec_norm(self):
+        """Fold decoder norms into encoder weights and bias for inference.
+
+        After folding, decoder rows become unit-norm and the rescaling is
+        permanently absorbed into W_enc and b_enc, so encode/decode no longer
+        need runtime norm computation.
+
+        Only valid when rescale_acts_by_decoder_norm=True.
+        """
+        if not self.config.rescale_acts_by_decoder_norm:
+            raise ValueError(
+                "fold_W_dec_norm is only valid when rescale_acts_by_decoder_norm=True"
+            )
+        W_dec_norm = self.W_dec.norm(dim=-1).clamp(min=1e-8)
+        self.b_enc.data *= W_dec_norm
+        W_dec_norms = W_dec_norm.unsqueeze(1)
+        self.W_dec.data /= W_dec_norms
+        self.W_enc.data *= W_dec_norms.T
 
     # ------------------------------------------------------------------
     # b_dec initialization
@@ -150,11 +183,8 @@ class TopKSAE(nn.Module):
     # ------------------------------------------------------------------
 
     def _compute_mse_loss(self, x: torch.Tensor, sae_out: torch.Tensor) -> torch.Tensor:
-        """Normalized MSE: MSE divided by the norm of the centered input."""
-        x_centred = x - x.mean(dim=0, keepdim=True)
-        mse = F.mse_loss(sae_out, x.detach(), reduction="none")
-        norm_factor = torch.norm(x_centred, p=2, dim=-1, keepdim=True)
-        return (mse / (norm_factor + EPSILON)).mean()
+        """Standard MSE: sum over feature dim, mean over batch."""
+        return F.mse_loss(sae_out, x, reduction="none").sum(dim=-1).mean()
 
     def _compute_aux_topk_loss(
         self,
@@ -166,14 +196,8 @@ class TopKSAE(nn.Module):
         """Auxiliary TopK loss for dead-feature revival.
 
         From Gao et al. "Scaling and Evaluating Sparse Autoencoders" (Appendix B.1).
-        Instead of ghost gradients, dead features get their own top-k selection
-        over the residual. This is much more effective for TopK SAEs because
-        dead features don't compete with alive features.
-
-        Mechanism:
-            1. Compute residual = x - sae_out (what alive features missed)
-            2. Among dead features only, select top k_aux by pre-activation
-            3. Decode through dead features and compute MSE against residual
+        Dead features get their own top-k selection over the residual, so they
+        don't compete with alive features.
         """
         num_dead = int(dead_neuron_mask.sum())
         if num_dead == 0:
@@ -183,18 +207,18 @@ class TopKSAE(nn.Module):
 
         # k_aux = d_in // 2 (heuristic from Appendix B.1)
         k_aux = self.d_in // 2
-        # Scale down when few features are dead
         scale = min(num_dead / k_aux, 1.0)
         k_aux = min(k_aux, num_dead)
 
         # Select top-k_aux among dead features only (alive set to -inf)
-        auxk_latents = torch.where(dead_neuron_mask[None], hidden_pre, torch.tensor(-torch.inf, device=x.device))
+        auxk_latents = torch.where(
+            dead_neuron_mask[None], hidden_pre, torch.tensor(-torch.inf, device=x.device)
+        )
         auxk_topk = auxk_latents.topk(k_aux, sorted=False)
 
         auxk_acts = torch.zeros_like(hidden_pre)
         auxk_acts.scatter_(-1, auxk_topk.indices, auxk_topk.values)
 
-        # Decode through all features (only dead ones are non-zero)
         recons = self.decode(auxk_acts)
         auxk_loss = (recons - residual).pow(2).sum(dim=-1).mean()
 
@@ -209,18 +233,22 @@ class TopKSAE(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Encode input activations to sparse feature activations.
 
-        Args:
-            x: Input tensor of shape (..., d_in).
+        When rescale_acts_by_decoder_norm=True, pre-activations are scaled
+        by decoder row norms so that top-k selection is invariant to decoder
+        norm magnitude.
 
         Returns:
-            Tuple of (sparse_acts, hidden_pre) where hidden_pre is the
-            pre-activation (needed for auxiliary loss).
+            Tuple of (sparse_acts, hidden_pre).
         """
         if self.config.normalize_activations == "layer_norm":
             x = F.layer_norm(x, (self.d_in,))
 
         x_centered = x - self.b_dec
         hidden_pre = x_centered @ self.W_enc + self.b_enc
+
+        if self.config.rescale_acts_by_decoder_norm:
+            hidden_pre = hidden_pre * self.W_dec.norm(dim=-1)
+
         post_relu = F.relu(hidden_pre)
         topk_values, topk_indices = post_relu.topk(self.k, dim=-1, sorted=False)
 
@@ -230,7 +258,13 @@ class TopKSAE(nn.Module):
         return sparse_acts, hidden_pre
 
     def decode(self, feature_acts: torch.Tensor) -> torch.Tensor:
-        """Decode sparse feature activations back to input space."""
+        """Decode sparse feature activations back to input space.
+
+        When rescale_acts_by_decoder_norm=True, feature activations are
+        divided by decoder row norms to undo the encode-time rescaling.
+        """
+        if self.config.rescale_acts_by_decoder_norm:
+            feature_acts = feature_acts / self.W_dec.norm(dim=-1)
         return feature_acts @ self.W_dec + self.b_dec
 
     def forward(
@@ -239,11 +273,6 @@ class TopKSAE(nn.Module):
         dead_neuron_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward pass: encode, decode, and compute losses.
-
-        Args:
-            x: Input tensor of shape (..., d_in).
-            dead_neuron_mask: Boolean mask of shape (d_sae,) indicating dead
-                features (True = dead). Used for auxiliary TopK loss.
 
         Returns:
             Tuple of (reconstruction, sparse_acts, loss, mse_loss, aux_loss).
@@ -293,7 +322,8 @@ class TopKSAE(nn.Module):
         return (
             f"TopKSAE(d_in={self.d_in}, d_sae={self.d_sae}, k={self.k}, "
             f"expansion={self.config.expansion_factor}x, "
-            f"aux_coeff={self.config.aux_loss_coefficient})"
+            f"aux_coeff={self.config.aux_loss_coefficient}, "
+            f"rescale_dec_norm={self.config.rescale_acts_by_decoder_norm})"
         )
 
 
@@ -307,7 +337,7 @@ class TopKSAETrainer:
         - Cosine annealing with warmup LR schedule
         - Dead feature tracking via n_forward_passes_since_fired
         - Auxiliary TopK loss for dead-feature revival
-        - Train step order: unit norm -> forward -> backward -> clip -> orthogonalize -> step -> schedule
+        - Train step order: forward -> backward -> clip -> step -> schedule
     """
 
     def __init__(
@@ -452,32 +482,25 @@ class TopKSAETrainer:
     def train_step(self, batch: torch.Tensor) -> Dict[str, float]:
         """Perform a single training step.
 
-        Step order:
-            1. set_decoder_norm_to_unit_norm
-            2. Forward with dead_neuron_mask
-            3. Update dead feature tracking
-            4. loss.backward()
-            5. Gradient clipping
-            6. remove_gradient_parallel_to_decoder_directions
-            7. optimizer.step()
-            8. scheduler.step()
+        Step order (SAELens style, no per-step decoder norm management):
+            1. Forward with dead_neuron_mask
+            2. Update dead feature tracking
+            3. loss.backward()
+            4. Gradient clipping
+            5. optimizer.step()
+            6. scheduler.step()
         """
         self.model.train()
         batch = batch.to(device=self.device, dtype=torch.float32, non_blocking=True)
 
-        unwrapped = self._unwrap_model()
-
-        # 1. Normalize decoder to unit norm before forward
-        unwrapped.set_decoder_norm_to_unit_norm()
-
-        # 2. Forward with dead neuron mask
+        # 1. Forward with dead neuron mask
         self.optimizer.zero_grad()
         dead_neuron_mask = self._get_dead_neuron_mask()
         reconstruction, sparse_acts, loss, mse_loss, aux_loss = self.model(
             batch, dead_neuron_mask
         )
 
-        # 3. Update dead feature tracking
+        # 2. Update dead feature tracking
         self._update_dead_feature_tracking(sparse_acts)
 
         # Skip step if loss is non-finite
@@ -490,22 +513,19 @@ class TopKSAETrainer:
             metrics["loss"] = float("nan")
             return metrics
 
-        # 4. Backward
+        # 3. Backward
         loss.backward()
 
-        # 5. Gradient clipping
+        # 4. Gradient clipping
         if self.max_grad_norm > 0:
             torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(), max_norm=self.max_grad_norm
             )
 
-        # 6. Remove gradient parallel to decoder directions
-        unwrapped.remove_gradient_parallel_to_decoder_directions()
-
-        # 7. Optimizer step
+        # 5. Optimizer step
         self.optimizer.step()
 
-        # 8. Scheduler step
+        # 6. Scheduler step
         self.scheduler.step()
 
         metrics = self.calculate_metrics(
