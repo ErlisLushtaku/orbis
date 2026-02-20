@@ -705,6 +705,7 @@ def train_epoch(
         "activation_density": 0.0,
         "l1_norm": 0.0,
         "dead_pct": 0.0,
+        "n_revived": 0.0,
         "lr": 0.0,
     }
     # Per-metric valid counts (some metrics can be NaN from fp16 edge cases)
@@ -761,6 +762,7 @@ def train_epoch(
             "loss": f"{metrics['loss']:.4f}",
             "l0": f"{metrics['l0']:.1f}",
             "dead%": f"{metrics['dead_pct']:.1f}",
+            "revived": f"{metrics.get('n_revived', 0):.0f}",
             "io%": f"{io_pct:.1f}",
         })
 
@@ -789,7 +791,7 @@ def eval_epoch(
     trainer: TopKSAETrainer,
     dataloader: DataLoader,
 ) -> Dict[str, float]:
-    """Evaluate on validation set with full Phase 1 metric logging."""
+    """Evaluate on validation set with dataset-wide dead feature tracking."""
     
     metrics_sum = {
         "loss": 0.0,
@@ -802,14 +804,21 @@ def eval_epoch(
         "activation_density": 0.0,
         "l1_norm": 0.0,
         "dead_pct": 0.0,
+        "n_revived": 0.0,
         "lr": 0.0,
     }
     valid_counts = {k: 0 for k in metrics_sum}
     num_batches = 0
+
+    unwrapped = trainer._unwrap_model()
+    feature_ever_active = torch.zeros(
+        unwrapped.d_sae, dtype=torch.bool, device=trainer.device
+    )
     
     eval_start = time.perf_counter()
     for batch in tqdm(dataloader, desc="Evaluating", file=sys.stdout, mininterval=360.0):
-        metrics = trainer.eval_step(batch)
+        metrics, sparse_acts = trainer.eval_step(batch)
+        feature_ever_active |= (sparse_acts > 0).any(dim=0)
         
         for k in metrics_sum.keys():
             if k in metrics and math.isfinite(metrics[k]):
@@ -823,6 +832,9 @@ def eval_epoch(
         for k, v in metrics_sum.items()
     }
     avg_metrics['eval_time_s'] = eval_time
+
+    n_dead = int((~feature_ever_active).sum().item())
+    avg_metrics['val_dead_pct'] = (n_dead / unwrapped.d_sae) * 100.0
     
     return avg_metrics
 
@@ -1007,6 +1019,8 @@ def _save_experiment_config(
             "eval_every": args.eval_every,
             "save_every": args.save_every,
             "seed": args.seed,
+            "compile": args.compile,
+            "val_split": 0.1,
         },
         "activation": {
             "layer_idx": args.layer,
@@ -1141,13 +1155,15 @@ def _run_training_loop(
                 f"R\u00b2={train_metrics['explained_variance']:.4f} "
                 f"cos={train_metrics['cos_sim']:.4f} "
                 f"dead%={train_metrics['dead_pct']:.1f} "
+                f"revived={train_metrics.get('n_revived', 0):.0f} "
                 f"lr={train_metrics.get('lr', 0):.2e} "
                 f"io%={epoch_stats_rec.io_wait_pct:.1f}"
             )
             if val_metrics is not None:
                 logger.info(
                     f"  Val: loss={val_metrics['loss']:.4f} l0={val_metrics['l0']:.1f} "
-                    f"R\u00b2={val_metrics['explained_variance']:.4f} cos={val_metrics['cos_sim']:.4f}"
+                    f"R\u00b2={val_metrics['explained_variance']:.4f} cos={val_metrics['cos_sim']:.4f} "
+                    f"dead%={val_metrics.get('val_dead_pct', float('nan')):.1f}"
                 )
 
             compare_loss = val_metrics['loss'] if val_metrics else train_metrics['loss']
@@ -1773,7 +1789,7 @@ def parse_args(argv=None):
     parser.add_argument("--aux_loss_coefficient", type=float, default=1.0,
                         help="Coefficient for auxiliary TopK loss (dead-feature revival). "
                              "Set to 0 to disable. Default: 1.0 (from Gao et al.)")
-    parser.add_argument("--dead_feature_window", type=int, default=1000,
+    parser.add_argument("--dead_feature_window", type=int, default=5000,
                         help="Steps without firing before a feature is considered dead")
     parser.add_argument("--decoder_init_norm", type=float, default=0.1,
                         help="Normalize decoder rows to this norm at init (0.1 from Anthropic). "

@@ -27,7 +27,7 @@
 
 #SBATCH --job-name=sae_grounding
 #SBATCH --time=06:00:00
-#SBATCH --partition=tflmb_gpu-rtx3090
+#SBATCH --partition=tflmb_gpu-rtx4090
 #SBATCH --account=lmbhiwi-dlc
 #SBATCH --gres=gpu:1
 #SBATCH --mem=64G

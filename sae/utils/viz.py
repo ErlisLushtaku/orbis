@@ -4,7 +4,8 @@ Visualization utilities for SAE latent interpretability.
 Provides reusable functions for multi-granularity SAE visualization:
 - Overlay heatmaps: spatial activation maps overlaid on frames
 - Top frames grids: grid of top-activating frames with overlaid heatmaps
-- Clip videos: mp4 sequences from frame arrays
+- Clip heatmap videos: mp4 sequences with per-clip normalized heatmap overlays
+- Clip videos: mp4 sequences from raw frame arrays
 - Frame PNGs: single-frame image saving
 """
 
@@ -170,8 +171,231 @@ def create_clip_video(
     writer.release()
 
 
+def _composite_heatmap_on_frame(
+    frame_rgb: np.ndarray,
+    heatmap_2d: np.ndarray,
+    grid_h: int,
+    grid_w: int,
+    cmap: mcolors.Colormap,
+    vmin: float,
+    vmax: float,
+) -> np.ndarray:
+    """Alpha-blend an upscaled heatmap overlay onto an RGB frame.
+
+    Uses the colormap's built-in alpha channel (e.g. VIRIDIS_ALPHA) for
+    compositing, and explicit vmin/vmax for consistent normalization across
+    frames in a clip.
+
+    Returns:
+        Composited (H, W, 3) uint8 RGB frame.
+    """
+    img_h, img_w = frame_rgb.shape[:2]
+
+    acts = np.asarray(heatmap_2d, dtype=np.float32)
+    if acts.ndim == 1:
+        acts = acts.reshape(grid_h, grid_w)
+    heatmap = _interpolate_heatmap(acts, (img_w, img_h))
+
+    if vmax > vmin:
+        heatmap_norm = np.clip((heatmap - vmin) / (vmax - vmin), 0.0, 1.0)
+    else:
+        heatmap_norm = np.zeros_like(heatmap)
+
+    rgba = cmap(heatmap_norm)  # (H, W, 4) float [0, 1]
+    alpha = rgba[:, :, 3:4]
+
+    frame_f = frame_rgb.astype(np.float32) / 255.0
+    blended = frame_f * (1.0 - alpha) + rgba[:, :, :3] * alpha
+    return (np.clip(blended, 0.0, 1.0) * 255).astype(np.uint8)
+
+
+def _render_sparkline_base(
+    per_frame_max: np.ndarray,
+    per_frame_mean: np.ndarray,
+    y_max: float,
+    width_px: int,
+    height_px: int,
+) -> np.ndarray:
+    """Render a static temporal activation plot as an RGB numpy array.
+
+    Draws max-activation (orange) and mean-activation (blue) curves on a
+    white background. The result is rendered once and re-used across frames,
+    with only the vertical time indicator changing per frame.
+
+    Returns:
+        (height_px, width_px, 3) uint8 RGB image.
+    """
+    dpi = 100
+    fig, ax = plt.subplots(
+        figsize=(width_px / dpi, height_px / dpi), dpi=dpi,
+    )
+
+    t_axis = np.arange(len(per_frame_max))
+    ax.plot(t_axis, per_frame_max, color="#E07020", linewidth=2.0, label="max")
+    ax.plot(t_axis, per_frame_mean, color="#3070C0", linewidth=2.0, label="mean")
+    ax.set_xlim(-0.5, len(per_frame_max) - 0.5)
+    ax.set_ylim(0, y_max)
+    ax.set_ylabel("activation", fontsize=10)
+    ax.set_xlabel("frame", fontsize=10)
+    ax.tick_params(labelsize=9)
+    ax.legend(fontsize=10, loc="upper right", framealpha=0.7)
+
+    fig.tight_layout(pad=0.4)
+
+    fig.canvas.draw()
+    buf = np.asarray(fig.canvas.buffer_rgba())[:, :, :3].copy()
+    sparkline = cv2.resize(buf, (width_px, height_px), interpolation=cv2.INTER_AREA)
+    plt.close(fig)
+    return sparkline
+
+
+def create_clip_heatmap_video(
+    frames_rgb: List[np.ndarray],
+    spatial_maps: List[np.ndarray],
+    output_path: Path,
+    grid_h: int = ORBIS_GRID_H,
+    grid_w: int = ORBIS_GRID_W,
+    cmap: Optional[mcolors.Colormap] = None,
+    fps: int = 5,
+    target_frame_idx: Optional[int] = None,
+    title: Optional[str] = None,
+    show_sparkline: bool = True,
+) -> None:
+    """Create an mp4 video of heatmap-overlaid frames with per-clip normalization.
+
+    All frames share the same colormap scale (vmin=0, vmax=clip_max) so
+    temporal dynamics are visible: a feature fading out actually looks
+    like it is fading out.
+
+    Each frame includes a text overlay showing ``Peak Act: <clip_max>``
+    for cross-clip comparison.  The target frame (if specified) is
+    highlighted with a colored border.
+
+    When ``show_sparkline`` is True, the bottom 20% of each video frame
+    shows a temporal activation plot (max and mean per frame) with a
+    vertical bar tracking the current frame index.
+
+    Args:
+        frames_rgb: List of T (H, W, 3) uint8 frames for the clip.
+        spatial_maps: List of T spatial activation arrays, each
+            (grid_h*grid_w,) or (grid_h, grid_w).  Must match length
+            of frames_rgb.
+        output_path: Destination .mp4 path.
+        grid_h: Spatial grid height.
+        grid_w: Spatial grid width.
+        cmap: Colormap for the heatmap overlay. Defaults to VIRIDIS_ALPHA.
+        fps: Frames per second for the output video.
+        target_frame_idx: Index of the target frame within the clip
+            (highlighted with a green border).
+        title: Optional text burned into the top-left of every frame.
+        show_sparkline: When True, append a temporal sparkline plot below
+            the heatmap video.
+    """
+    if not frames_rgb or not spatial_maps:
+        return
+    if len(frames_rgb) != len(spatial_maps):
+        logger.warning(
+            "Frame/spatial map count mismatch (%d vs %d), truncating",
+            len(frames_rgb), len(spatial_maps),
+        )
+    n = min(len(frames_rgb), len(spatial_maps))
+    if n == 0:
+        return
+
+    if cmap is None:
+        cmap = VIRIDIS_ALPHA
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    acts_arrays = [np.asarray(m, dtype=np.float32) for m in spatial_maps[:n]]
+    clip_max = float(max(a.max() for a in acts_arrays))
+    vmin = 0.0
+    vmax = clip_max if clip_max > 0 else 1.0
+
+    h, w = frames_rgb[0].shape[:2]
+
+    # Pre-compute per-frame statistics for sparkline
+    per_frame_max = np.array([a.max() for a in acts_arrays], dtype=np.float32)
+    per_frame_mean = np.array([a.mean() for a in acts_arrays], dtype=np.float32)
+
+    sparkline_h = 0
+    sparkline_base = None
+    if show_sparkline and n > 1:
+        sparkline_h = max(int(h * 0.3), 90)
+        y_axis_max = clip_max * 1.2 if clip_max > 0 else 1.0
+        sparkline_base = _render_sparkline_base(
+            per_frame_max, per_frame_mean, y_axis_max, w, sparkline_h,
+        )
+
+    total_h = h + sparkline_h
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(str(output_path), fourcc, fps, (w, total_h))
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.5
+    font_thickness = 1
+    text_color = (255, 255, 255)
+    text_bg = (0, 0, 0)
+    border_px = 3
+
+    for t in range(n):
+        composited = _composite_heatmap_on_frame(
+            frames_rgb[t], spatial_maps[t], grid_h, grid_w, cmap, vmin, vmax,
+        )
+
+        if target_frame_idx is not None and t == target_frame_idx:
+            cv2.rectangle(
+                composited, (0, 0), (w - 1, h - 1),
+                color=(0, 255, 0), thickness=border_px,
+            )
+
+        peak_text = f"Peak Act: {clip_max:.2f}"
+        (tw, th), _ = cv2.getTextSize(peak_text, font, font_scale, font_thickness)
+        cv2.rectangle(composited, (4, 4), (10 + tw, 10 + th), text_bg, -1)
+        cv2.putText(
+            composited, peak_text, (7, 7 + th),
+            font, font_scale, text_color, font_thickness, cv2.LINE_AA,
+        )
+
+        if title:
+            (tw2, th2), _ = cv2.getTextSize(title, font, font_scale, font_thickness)
+            y_off = 16 + th
+            cv2.rectangle(composited, (4, y_off), (10 + tw2, y_off + 6 + th2), text_bg, -1)
+            cv2.putText(
+                composited, title, (7, y_off + 3 + th2),
+                font, font_scale, text_color, font_thickness, cv2.LINE_AA,
+            )
+
+        if sparkline_base is not None:
+            sparkline_frame = sparkline_base.copy()
+            # Draw vertical time indicator at current frame position
+            # Map frame index t to pixel x using the matplotlib axis limits
+            margin_left = int(w * 0.1)
+            margin_right = int(w * 0.03)
+            plot_w = w - margin_left - margin_right
+            if n > 1:
+                x_px = margin_left + int(t / (n - 1) * plot_w)
+            else:
+                x_px = margin_left + plot_w // 2
+            cv2.line(
+                sparkline_frame,
+                (x_px, 0), (x_px, sparkline_h),
+                color=(220, 50, 50), thickness=2,
+            )
+            composited = np.vstack([composited, sparkline_frame])
+        elif sparkline_h > 0:
+            pad = np.full((sparkline_h, w, 3), 255, dtype=np.uint8)
+            composited = np.vstack([composited, pad])
+
+        bgr = cv2.cvtColor(np.ascontiguousarray(composited), cv2.COLOR_RGB2BGR)
+        writer.write(bgr)
+
+    writer.release()
+
+
 # ---------------------------------------------------------------------------
-# Public API -- overlay heatmap visualizations
+# Public API -- overlay heatmap visualizations (static images)
 # ---------------------------------------------------------------------------
 
 
@@ -183,6 +407,8 @@ def create_overlay_heatmap(
     grid_w: int = ORBIS_GRID_W,
     cmap: Optional[mcolors.Colormap] = None,
     title: Optional[str] = None,
+    vmin: Optional[float] = 0.0,
+    vmax: Optional[float] = None,
 ) -> None:
     """Create a frame with spatial activation heatmap overlaid directly on it.
 
@@ -199,6 +425,9 @@ def create_overlay_heatmap(
         grid_w: Spatial grid width (default 32 for Orbis 288x512).
         cmap: Matplotlib colormap for the heatmap. Defaults to VIRIDIS_ALPHA.
         title: Optional title for the figure.
+        vmin: Lower bound for colormap normalization. Default 0 ensures
+            zero activation maps to transparent with alpha colormaps.
+        vmax: Upper bound for colormap normalization. None uses per-frame max.
     """
     if cmap is None:
         cmap = VIRIDIS_ALPHA
@@ -218,7 +447,7 @@ def create_overlay_heatmap(
 
     fig, ax = plt.subplots(1, 1, figsize=(7, 5))
     ax.imshow(frame_norm)
-    ax.imshow(heatmap, cmap=cmap, alpha=1.0)
+    ax.imshow(heatmap, cmap=cmap, alpha=1.0, vmin=vmin, vmax=vmax)
     ax.axis("off")
 
     if title:
@@ -240,12 +469,18 @@ def create_top_frames_grid(
     subtitles: Optional[List[str]] = None,
     grid_rows: int = 2,
     grid_cols: int = 5,
+    vmin: Optional[float] = 0.0,
+    vmax: Optional[float] = None,
 ) -> None:
     """Create a grid of frames with overlaid activation heatmaps.
 
     Accepts pre-ranked frames (no internal re-ranking). Each subplot shows
     the original frame with its spatial activation heatmap overlaid using
     an alpha colormap and bicubic interpolation.
+
+    When ``vmax`` is None (default), it is computed as the maximum activation
+    across all provided spatial maps so that heatmap brightness is comparable
+    across the grid (e.g. rank 1 looks brighter than rank 10).
 
     Args:
         frames_rgb: List of (H, W, 3) uint8 frames, already ranked.
@@ -259,6 +494,10 @@ def create_top_frames_grid(
         subtitles: Optional per-subplot titles (e.g. activation values).
         grid_rows: Number of rows in the grid.
         grid_cols: Number of columns in the grid.
+        vmin: Lower bound for colormap normalization. Default 0 ensures
+            zero activation maps to transparent with alpha colormaps.
+        vmax: Upper bound for colormap normalization. None computes the
+            shared maximum across all spatial maps in the grid.
     """
     if cmap is None:
         cmap = VIRIDIS_ALPHA
@@ -268,6 +507,9 @@ def create_top_frames_grid(
 
     n_slots = grid_rows * grid_cols
     n_images = min(len(frames_rgb), n_slots)
+
+    if vmax is None and spatial_maps:
+        vmax = float(max(np.asarray(m, dtype=np.float32).max() for m in spatial_maps))
 
     fig, axes = plt.subplots(
         grid_rows, grid_cols,
@@ -297,7 +539,7 @@ def create_top_frames_grid(
 
             frame_norm = _normalize(_np_channel_last(frame))
             ax.imshow(frame_norm)
-            ax.imshow(heatmap, cmap=cmap, alpha=1.0)
+            ax.imshow(heatmap, cmap=cmap, alpha=1.0, vmin=vmin, vmax=vmax)
 
             if subtitles and i < len(subtitles):
                 ax.set_title(subtitles[i], fontsize=9)

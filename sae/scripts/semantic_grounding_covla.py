@@ -54,7 +54,12 @@ from sae.utils.constants import ORBIS_GRID_H, ORBIS_GRID_W
 from sae.utils.logging import get_logger, setup_sae_logging
 from sae.utils.model_loading import load_orbis_model, load_sae
 from sae.utils.spatial_tracker import SpatialEntry, SpatialTopKTracker
-from sae.utils.viz import create_clip_video, create_overlay_heatmap, save_frame_png
+from sae.utils.viz import (
+    create_clip_heatmap_video,
+    create_clip_video,
+    create_overlay_heatmap,
+    save_frame_png,
+)
 from data.covla.covla_dataset import CoVLAOrbisMultiFrame
 
 # Setup logging
@@ -592,10 +597,20 @@ def collect_activations(
                 sae_acts = sae.get_feature_activations(sample_acts)  # (spatial, num_latents)
                 sae_acts_mean = sae_acts.mean(dim=0).cpu().numpy()
                 
-                # Update spatial tracker (target frame only = last 576 tokens)
+                # Update spatial tracker with target + optional clip spatial maps
                 if need_tracker and tracker is not None:
                     num_spatial = ORBIS_GRID_H * ORBIS_GRID_W  # 576
-                    target_spatial = sae_acts[-num_spatial:, :].cpu().numpy()  # (576, num_latents)
+                    sae_acts_np = sae_acts.cpu().numpy()  # (total_tokens, num_latents)
+                    target_spatial = sae_acts_np[-num_spatial:]  # (576, num_latents)
+
+                    num_clip_frames = sae_acts_np.shape[0] // num_spatial
+                    clip_spatial = None
+                    if num_clip_frames > 1:
+                        usable_tokens = num_clip_frames * num_spatial
+                        clip_spatial = sae_acts_np[-usable_tokens:].reshape(
+                            1, num_clip_frames, num_spatial, -1,
+                        )  # (1, F, 576, num_latents)
+
                     tracker_meta = [{
                         "video_id": meta["video_id"],
                         "frame_idx": meta["frame_idx"],
@@ -606,6 +621,7 @@ def collect_activations(
                         sae_acts_mean[np.newaxis, :],
                         target_spatial[np.newaxis, :, :],
                         tracker_meta,
+                        clip_spatial,
                     )
                 
                 frame_act = FrameActivation(
@@ -667,10 +683,20 @@ def collect_activations(
         sae_acts = sae.get_feature_activations(acts.float())  # (B, N, d_sae)
         sae_acts_mean = sae_acts.mean(dim=1).cpu().numpy()
         
-        # Update spatial tracker (target frame only = last 576 tokens)
+        # Spatial tracker: target frame + optional full clip
         if need_tracker and tracker is not None:
             num_spatial = ORBIS_GRID_H * ORBIS_GRID_W  # 576
-            target_spatial = sae_acts[:, -num_spatial:, :].cpu().numpy()  # (B, 576, d_sae)
+            sae_acts_cpu = sae_acts.cpu().numpy()  # (B, total_tokens, d_sae)
+            target_spatial = sae_acts_cpu[:, -num_spatial:, :]  # (B, 576, d_sae)
+
+            num_clip_frames = sae_acts_cpu.shape[1] // num_spatial
+            clip_spatial = None
+            if num_clip_frames > 1:
+                usable_tokens = num_clip_frames * num_spatial
+                clip_spatial = sae_acts_cpu[:, -usable_tokens:, :].reshape(
+                    b, num_clip_frames, num_spatial, -1,
+                )  # (B, F, 576, d_sae)
+
             batch_metadata = [
                 {
                     "video_id": video_ids[i],
@@ -683,7 +709,7 @@ def collect_activations(
                 }
                 for i in range(b)
             ]
-            tracker.update(sae_acts_mean, target_spatial, batch_metadata)
+            tracker.update(sae_acts_mean, target_spatial, batch_metadata, clip_spatial)
         
         for i in range(b):
             metadata = metadata_list[i]
@@ -827,9 +853,18 @@ def collect_activations_from_val_cache(
         sae_acts = sae.get_feature_activations(acts_batched)
         sae_acts_mean = sae_acts.mean(dim=1).cpu().numpy()
 
-        # Spatial tracker: target frame only
+        # Spatial tracker: target frame + optional full clip
+        clip_spatial = None
         if need_tracker:
-            target_spatial = sae_acts[:, -num_spatial:, :].cpu().numpy()
+            sae_acts_cpu = sae_acts.cpu().numpy()
+            target_spatial = sae_acts_cpu[:, -num_spatial:, :]
+
+            num_clip_frames = sae_acts_cpu.shape[1] // num_spatial
+            if num_clip_frames > 1:
+                usable_tokens = num_clip_frames * num_spatial
+                clip_spatial = sae_acts_cpu[:, -usable_tokens:, :].reshape(
+                    actual_batch_size, num_clip_frames, num_spatial, -1,
+                )
 
         batch_metadata = []
         for i in range(actual_batch_size):
@@ -844,10 +879,12 @@ def collect_activations_from_val_cache(
             })
 
         if need_tracker and batch_metadata:
+            n = len(batch_metadata)
             tracker.update(
-                sae_acts_mean[:len(batch_metadata)],
-                target_spatial[:len(batch_metadata)],
+                sae_acts_mean[:n],
+                target_spatial[:n],
                 batch_metadata,
+                clip_spatial[:n] if clip_spatial is not None else None,
             )
 
         for i in range(actual_batch_size):
@@ -976,7 +1013,7 @@ def _save_covla_latent_visualizations(
         )
         create_overlay_heatmap(frame, entry.spatial_map, heatmap_path, title=title)
 
-        # Clip video
+        # Clip video (raw + heatmap overlay when spatial maps available)
         if entry.clip_frame_indices:
             clip_frames = _load_clip_from_video(
                 videos_dir, entry.video_id, entry.clip_frame_indices,
@@ -984,6 +1021,20 @@ def _save_covla_latent_visualizations(
             if clip_frames:
                 clip_path = output_dir / f"{prefix}_clip.mp4"
                 create_clip_video(clip_frames, clip_path)
+
+                if entry.clip_spatial_maps is not None:
+                    n_maps = entry.clip_spatial_maps.shape[0]
+                    n_frames = len(clip_frames)
+                    if n_maps == n_frames:
+                        target_idx_in_clip = n_frames - 1
+                        heatmap_clip_path = output_dir / f"{prefix}_clip_heatmap.mp4"
+                        create_clip_heatmap_video(
+                            clip_frames,
+                            [entry.clip_spatial_maps[i] for i in range(n_maps)],
+                            heatmap_clip_path,
+                            target_frame_idx=target_idx_in_clip,
+                            title=f"Latent {latent_idx}",
+                        )
 
     return saved_paths
 
@@ -1007,7 +1058,7 @@ def analyze_top_latents(
     latent_matrix = np.stack([a.latent_activations for a in activations], axis=0)
     top_latents = find_top_activating_latents(latent_matrix, top_n=top_n_latents, metric=metric)
 
-    top_latents_dir = output_dir / "top_latents"
+    top_latents_dir = output_dir / "top_activating_latents"
     top_latents_dir.mkdir(parents=True, exist_ok=True)
 
     has_tracker = tracker is not None
@@ -1122,7 +1173,7 @@ def save_top_frames(
     top_k_frames: int = 10,
 ) -> List[str]:
     """Save images (and optionally heatmaps/clips) of top-activating frames."""
-    frame_dir = output_dir / "frames" / f"latent_{latent_idx}_{field_name}"
+    frame_dir = output_dir / "top_correlating_latents" / f"latent_{latent_idx}_{field_name}"
     frame_dir.mkdir(parents=True, exist_ok=True)
 
     # If tracker available, use it for full visualization
@@ -1285,7 +1336,7 @@ def generate_detailed_frame_analysis(
             # Find top activating frames
             top_frames = find_top_activating_frames(activations, latent_idx, top_k)
             
-            frame_dir = output_dir / "frames" / f"latent_{latent_idx}_{field_name}"
+            frame_dir = output_dir / "top_correlating_latents" / f"latent_{latent_idx}_{field_name}"
             
             # List each frame with full details
             for j, frame in enumerate(top_frames):
@@ -1550,7 +1601,7 @@ def generate_report_from_saved(
             ])
             
             # Check for saved frames
-            frame_dir = output_dir / "frames" / f"latent_{latent_idx}_{field_name}"
+            frame_dir = output_dir / "top_correlating_latents" / f"latent_{latent_idx}_{field_name}"
             
             if not frame_dir.exists():
                 lines.append("*No saved frames found.*\n")

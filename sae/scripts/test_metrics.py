@@ -407,7 +407,7 @@ def test_train_step_with_new_metrics():
         print(f"  [OK] train_step returns all {len(required)} metrics")
         
         # Run eval step
-        metrics_eval = trainer.eval_step(x)
+        metrics_eval, _ = trainer.eval_step(x)
         
         for m in required:
             assert m in metrics_eval, f"eval_step missing {m}"

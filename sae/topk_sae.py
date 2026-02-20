@@ -35,7 +35,7 @@ class TopKSAEConfig:
     expansion_factor: int = 16
     k: int = 64
 
-    dead_feature_window: int = 1000
+    dead_feature_window: int = 5000
     aux_loss_coefficient: float = 1.0
     decoder_init_norm: Optional[float] = 0.1
     rescale_acts_by_decoder_norm: bool = True
@@ -384,6 +384,7 @@ class TopKSAETrainer:
         self.n_forward_passes_since_fired = torch.zeros(
             model.d_sae, device=self.device, dtype=torch.long
         )
+        self.n_revived_this_step = 0
 
     def _get_dead_neuron_mask(self) -> torch.Tensor:
         """Return boolean mask of features that haven't fired in dead_feature_window steps."""
@@ -397,11 +398,14 @@ class TopKSAETrainer:
         return self.model
 
     def _update_dead_feature_tracking(self, sparse_acts: torch.Tensor):
-        """Update per-feature firing tracker."""
+        """Update per-feature firing tracker and count revival events."""
         with torch.no_grad():
+            was_dead = self._get_dead_neuron_mask()
             did_fire = (sparse_acts > 0).float().sum(dim=0) > 0
             self.n_forward_passes_since_fired += 1
             self.n_forward_passes_since_fired[did_fire] = 0
+            revived = was_dead & did_fire
+            self.n_revived_this_step = int(revived.sum().item())
 
     def initialize_b_dec(self, dataloader, num_tokens: int = 50000):
         """Initialize b_dec from training data before the training loop."""
@@ -472,6 +476,7 @@ class TopKSAETrainer:
             "activation_density": activation_density,
             "l1_norm": l1_norm,
             "dead_pct": dead_pct,
+            "n_revived": self.n_revived_this_step,
             "lr": self.optimizer.param_groups[0]["lr"],
         }
 
@@ -534,8 +539,14 @@ class TopKSAETrainer:
         return metrics
 
     @torch.no_grad()
-    def eval_step(self, batch: torch.Tensor) -> Dict[str, float]:
-        """Evaluation step without gradient updates."""
+    def eval_step(
+        self, batch: torch.Tensor
+    ) -> Tuple[Dict[str, float], torch.Tensor]:
+        """Evaluation step without gradient updates.
+
+        Returns:
+            Tuple of (metrics dict, sparse_acts tensor).
+        """
         self.model.eval()
         batch = batch.to(device=self.device, dtype=torch.float32, non_blocking=True)
 
@@ -543,4 +554,4 @@ class TopKSAETrainer:
         metrics = self.calculate_metrics(
             batch, reconstruction, sparse_acts, mse_loss, aux_loss
         )
-        return metrics
+        return metrics, sparse_acts

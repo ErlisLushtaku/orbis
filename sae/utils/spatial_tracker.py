@@ -6,8 +6,13 @@ latent with their full spatial activation maps. This enables post-hoc
 visualization of which spatial tokens most activate each latent, without
 requiring a second GPU pass.
 
-Memory budget: num_latents x top_k x spatial_tokens x 4 bytes.
-For 12288 latents x 10 x 576 tokens = ~282 MB (CPU RAM).
+Memory budget (target-frame only):
+    num_latents x top_k x spatial_tokens x 4 bytes.
+    For 12288 latents x 10 x 576 tokens = ~282 MB (CPU RAM).
+
+With clip spatial maps (F frames per clip):
+    num_latents x top_k x F x spatial_tokens x 4 bytes.
+    For 12288 x 10 x 5 x 576 = ~1.4 GB (CPU RAM).
 """
 
 import heapq
@@ -30,8 +35,9 @@ class SpatialEntry:
     video_id: str
     frame_idx: int
     clip_frame_indices: List[int]
-    spatial_map: np.ndarray  # (N,) per-token activation for this latent
+    spatial_map: np.ndarray  # (N,) per-token activation for target frame
     metadata: Dict[str, float]  # odometry (NuPlan) or caption metadata (CoVLA)
+    clip_spatial_maps: Optional[np.ndarray] = None  # (F, N) per-frame spatial maps for the full clip
 
 
 class SpatialTopKTracker:
@@ -57,16 +63,22 @@ class SpatialTopKTracker:
         scores: np.ndarray,
         spatial_acts: np.ndarray,
         metadata: List[dict],
+        clip_spatial_acts: Optional[np.ndarray] = None,
     ) -> None:
         """Update tracker with a batch of samples.
 
         Args:
             scores: (B, num_latents) spatially-averaged activation per sample.
-            spatial_acts: (B, N, num_latents) full spatial activations.
+            spatial_acts: (B, N, num_latents) full spatial activations for
+                the target frame.
             metadata: List of B dicts, each with keys:
                 video_id, frame_idx, clip_frame_indices, and a data-source
                 specific metadata dict (odometry for NuPlan, caption scores
                 for CoVLA).
+            clip_spatial_acts: Optional (B, F, N, num_latents) per-frame
+                spatial activations for all clip frames. When provided, each
+                stored entry will include clip-level spatial maps for temporal
+                heatmap videos.
         """
         batch_size = scores.shape[0]
 
@@ -84,10 +96,19 @@ class SpatialTopKTracker:
 
             meta = metadata[i]
             sample_spatial = spatial_acts[i]  # (N, num_latents)
+            sample_clip = clip_spatial_acts[i] if clip_spatial_acts is not None else None
 
             for lat_idx in candidate_latents:
                 score = float(sample_scores[lat_idx])
                 heap = self._heaps[lat_idx]
+
+                will_store = len(heap) < self.top_k or score > heap[0][0]
+                if not will_store:
+                    continue
+
+                clip_maps = None
+                if sample_clip is not None:
+                    clip_maps = sample_clip[:, :, lat_idx].copy()  # (F, N)
 
                 entry = SpatialEntry(
                     score=score,
@@ -96,6 +117,7 @@ class SpatialTopKTracker:
                     clip_frame_indices=meta.get("clip_frame_indices", []),
                     spatial_map=sample_spatial[:, lat_idx].copy(),
                     metadata=meta.get("metadata", meta.get("odometry", {})),
+                    clip_spatial_maps=clip_maps,
                 )
 
                 if len(heap) < self.top_k:
@@ -103,7 +125,7 @@ class SpatialTopKTracker:
                     self._counter += 1
                     if len(heap) == self.top_k:
                         self._mins[lat_idx] = heap[0][0]
-                elif score > heap[0][0]:
+                else:
                     heapq.heapreplace(heap, (score, self._counter, entry))
                     self._counter += 1
                     self._mins[lat_idx] = heap[0][0]
@@ -117,14 +139,20 @@ class SpatialTopKTracker:
         )
 
     def save(self, path: Path) -> None:
-        """Serialize tracker data to disk."""
+        """Serialize tracker data to disk.
+
+        Version 2 adds optional ``clip_spatial_maps`` per entry.  Older
+        loaders that expect version 1 will simply ignore the extra key.
+        """
         data: Dict[int, list] = {}
+        has_clip_spatial = False
         for lat_idx in range(self.num_latents):
             entries = self.get_top_k(lat_idx)
             if not entries:
                 continue
-            data[lat_idx] = [
-                {
+            serialised = []
+            for e in entries:
+                d = {
                     "score": e.score,
                     "video_id": e.video_id,
                     "frame_idx": e.frame_idx,
@@ -132,24 +160,30 @@ class SpatialTopKTracker:
                     "spatial_map": e.spatial_map,
                     "metadata": e.metadata,
                 }
-                for e in entries
-            ]
+                if e.clip_spatial_maps is not None:
+                    d["clip_spatial_maps"] = e.clip_spatial_maps
+                    has_clip_spatial = True
+                serialised.append(d)
+            data[lat_idx] = serialised
+
+        version = 2 if has_clip_spatial else 1
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(
-            {"version": 1, "num_latents": self.num_latents, "data": data}, path,
+            {"version": version, "num_latents": self.num_latents, "data": data}, path,
         )
         size_mb = path.stat().st_size / (1024 * 1024)
         logger.info(
-            f"Saved spatial top-K cache ({len(data)} active latents) "
+            f"Saved spatial top-K cache v{version} ({len(data)} active latents) "
             f"to {path} ({size_mb:.1f} MB)",
         )
 
     @classmethod
     def load(cls, path: Path) -> "SpatialTopKTracker":
-        """Load tracker from disk."""
+        """Load tracker from disk.  Backward-compatible with v1 caches."""
         cache = torch.load(path, weights_only=False)
         num_latents = cache["num_latents"]
         data = cache["data"]
+        version = cache.get("version", 1)
         max_k = max((len(entries) for entries in data.values()), default=10)
         tracker = cls(num_latents=num_latents, top_k=max_k)
         for lat_idx, entries in data.items():
@@ -163,6 +197,7 @@ class SpatialTopKTracker:
                     metadata=entry_dict.get(
                         "metadata", entry_dict.get("odometry", {}),
                     ),
+                    clip_spatial_maps=entry_dict.get("clip_spatial_maps"),
                 )
                 heapq.heappush(
                     tracker._heaps[lat_idx],
@@ -172,6 +207,7 @@ class SpatialTopKTracker:
             if tracker._heaps[lat_idx]:
                 tracker._mins[lat_idx] = tracker._heaps[lat_idx][0][0]
         logger.info(
-            f"Loaded spatial top-K cache ({len(data)} active latents) from {path}",
+            f"Loaded spatial top-K cache v{version} "
+            f"({len(data)} active latents) from {path}",
         )
         return tracker
