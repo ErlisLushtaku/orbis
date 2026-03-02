@@ -2,12 +2,24 @@
 import os
 import time
 import random
+import sys
+from pathlib import Path
 
 import torch
 import torchvision.utils as vutils
 from torch.utils.tensorboard import SummaryWriter  # <-- NEW
 
-from data.covla.covla_dataset import CoVLAOrbisMultiFrame
+WORLD_MODEL_SAE_ROOT = Path(
+    os.environ.get(
+        "WORLD_MODEL_SAE_ROOT",
+        Path(__file__).resolve().parents[3] / "WorldModelSAE",
+    )
+).resolve()
+WORLD_MODEL_SAE_SRC = WORLD_MODEL_SAE_ROOT / "src"
+if WORLD_MODEL_SAE_SRC.exists() and str(WORLD_MODEL_SAE_SRC) not in sys.path:
+    sys.path.insert(0, str(WORLD_MODEL_SAE_SRC))
+
+from world_model_sae.data.datasets.covla import CoVLAOrbisMultiFrame
 
 from finetuning.adaln_config import (
     TrainHyperparams,
